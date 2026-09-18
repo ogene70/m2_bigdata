@@ -2,14 +2,20 @@ import io
 import os
 from datetime import datetime
 
+import duckdb
 import pandas as pd
 import plotly.express as px
 import s3fs
 import streamlit as st
+from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import NoSuchTableError
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "s3:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "root")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "root-134")
+NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie:19120/iceberg/")
+NESSIE_WAREHOUSE = os.getenv("NESSIE_WAREHOUSE", "warehouse")
+ICEBERG_TABLE = "analytics.sessions"
 BUCKET = "sessions"
 REGION = "us-east-1"
 
@@ -80,18 +86,94 @@ def sanitize_timestamps(df):
     return df
 
 
+def iceberg_catalog():
+    return load_catalog(
+        "nessie",
+        **{
+            "type": "rest",
+            "uri": NESSIE_URI,
+            "warehouse": NESSIE_WAREHOUSE,
+            "s3.endpoint": f"http://{MINIO_ENDPOINT}",
+            "s3.access-key-id": MINIO_ACCESS_KEY,
+            "s3.secret-access-key": MINIO_SECRET_KEY,
+            "s3.region": REGION,
+            "s3.path-style-access": "true",
+        },
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def load_iceberg_sessions():
+    try:
+        cat = iceberg_catalog()
+        table = cat.load_table(ICEBERG_TABLE)
+        df = table.scan().to_arrow().to_pandas()
+        if "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return df
+    except (NoSuchTableError, FileNotFoundError, RuntimeError, ValueError, OSError):
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_resource(show_spinner=False)
+def get_duckdb():
+    con = duckdb.connect(database=":memory:")
+    con.execute("SET unsafe_enable_version_guessing = true;")
+    con.execute(
+        "CREATE SECRET minio ("
+        f"TYPE S3, KEY_ID '{MINIO_ACCESS_KEY}', SECRET '{MINIO_SECRET_KEY}', "
+        f"REGION '{REGION}', ENDPOINT '{MINIO_ENDPOINT}', "
+        f"URL_STYLE 'path', USE_SSL false)"
+    )
+    return con
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def iceberg_location():
+    try:
+        cat = iceberg_catalog()
+        return cat.load_table(ICEBERG_TABLE).location()
+    except Exception:
+        return None
+
+
+def run_sql(sql, df):
+    con = get_duckdb()
+    loc = iceberg_location()
+    if loc:
+        con.execute(f"CREATE OR REPLACE TEMP VIEW sessions AS SELECT * FROM iceberg_scan('{loc}')")
+    else:
+        con.register("df", df)
+        con.execute("CREATE OR REPLACE TEMP VIEW sessions AS SELECT * FROM df")
+    return con.execute(sql).fetchdf()
+
+
 fs = get_s3_filesystem()
 parquet_paths = list_parquet_paths(fs)
 
-st.sidebar.title("📊 Sessions")
-st.sidebar.caption(f"Bucket : `{BUCKET}` ({len(parquet_paths)} fichier(s))")
+df = load_iceberg_sessions()
+from_iceberg = not df.empty
 
-with st.spinner("Chargement des sessions depuis MinIO..."):
-    df = load_all_sessions(tuple(parquet_paths))
+st.sidebar.title("📊 Sessions")
+if from_iceberg:
+    source_label = "Iceberg"
+    st.sidebar.caption(f"Table Iceberg : `{ICEBERG_TABLE}`")
+else:
+    source_label = "MinIO (parquet)"
+    st.sidebar.caption(f"Bucket : `{BUCKET}` ({len(parquet_paths)} fichier(s))")
+
+if df.empty and parquet_paths:
+    with st.spinner("Chargement des sessions depuis MinIO (parquet)..."):
+        df = load_all_sessions(tuple(parquet_paths))
 
 if df.empty:
-    st.warning("Aucune donnée de session trouvée dans le bucket `sessions`.")
-    st.info("Démarrez des conversations et elles seront archivées automatiquement.")
+    st.warning("Aucune donnée de session trouvée.")
+    if from_iceberg:
+        st.info("Exécutez `./iceberg-ingest.sh` après avoir archivé des sessions.")
+    else:
+        st.info("Démarrez des conversations et elles seront archivées automatiquement.")
     st.stop()
 
 # ---- Sidebar filters ----
@@ -225,6 +307,39 @@ session_table.columns = [
     "dernier message",
 ]
 st.dataframe(session_table, use_container_width=True, hide_index=True)
+
+# ---- Requête SQL ----
+st.divider()
+st.subheader("🛠️ Requête SQL (DuckDB sur Iceberg)")
+
+SQL_EXAMPLES = {
+    "Messages par rôle": "SELECT role, count(*) AS n FROM sessions GROUP BY role ORDER BY n DESC",
+    "Messages par session": "SELECT session_id, count(*) AS messages FROM sessions GROUP BY session_id ORDER BY messages DESC",
+    "Modèles utilisés": "SELECT model, count(*) AS n, avg(length(content)) AS avg_len FROM sessions GROUP BY model ORDER BY n DESC",
+    "Activité maximale par jour": "SELECT CAST(timestamp AS DATE) AS jour, count(*) AS messages FROM sessions GROUP BY jour ORDER BY jour",
+    "Perimetre (toutes les données)": "SELECT * FROM sessions LIMIT 10",
+    "Gabarit (les 5 plus longues réponses)": "SELECT session_id, role, length(content) AS taille, left(content, 80) AS extrait FROM sessions ORDER BY taille DESC LIMIT 5",
+}
+
+example_name = st.selectbox("Exemple", list(SQL_EXAMPLES.keys()))
+sql_text = st.text_area(
+    "Écrivez votre requête SQL",
+    value=SQL_EXAMPLES[example_name],
+    height=150,
+    help="La table Iceberg est exposée comme vue `sessions`. Ex : SELECT * FROM sessions WHERE role = 'assistant' LIMIT 10",
+)
+
+run_clicked = st.button("▶ Exécuter", type="primary")
+
+if run_clicked and sql_text.strip():
+    try:
+        result = run_sql(sql_text, df)
+        st.success(f"Requête exécutée — {len(result)} ligne(s)")
+        st.dataframe(result, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Échec de la requête : {e}")
+elif run_clicked and not sql_text.strip():
+    st.warning("Requête SQL vide.")
 
 # ---- Selected session chat view ----
 st.divider()

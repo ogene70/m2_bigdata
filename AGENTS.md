@@ -351,3 +351,4 @@ archives/20260917-132455-a7f29587.parquet
 - Do not use external cloud storage services.
 - Do not use AWS endpoints.
 - Use only the local Dockerized MinIO instance.
+- Always resume your actions after build session 

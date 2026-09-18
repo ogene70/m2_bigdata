@@ -2,15 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    streamlit \
-    pandas \
-    pyarrow \
-    s3fs \
-    plotly
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
-COPY requirements.txt .
+COPY ingest.py .
+COPY query.py .
 
 EXPOSE 8501
 

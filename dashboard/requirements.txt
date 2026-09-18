@@ -3,3 +3,5 @@ pandas
 pyarrow
 s3fs
 plotly
+pyiceberg[pyarrow]
+duckdb

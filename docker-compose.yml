@@ -18,6 +18,35 @@ services:
       timeout: 5s
       retries: 5
 
+  nessie:
+    image: ghcr.io/projectnessie/nessie:latest
+    container_name: m2-bigdata-nessie
+    restart: unless-stopped
+    ports:
+      - "19120:19120"
+    environment:
+      nessie.version.store.type: ROCKSDB
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://warehouse/
+      nessie.catalog.service.s3.default-options.endpoint: http://s3:9000/
+      nessie.catalog.service.s3.default-options.access-key: urn:nessie-secret:quarkus:nessie.catalog.secrets.access-key
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.auth-type: STATIC
+      nessie.catalog.secrets.access-key.name: root
+      nessie.catalog.secrets.access-key.secret: root-134
+      nessie.catalog.service.s3.default-options.region: us-east-1
+      nessie.server.authentication.enabled: "false"
+    depends_on:
+      - s3
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    volumes:
+      - nessie-data:/var/lib/nessie
+
   dashboard:
     build: ./dashboard
     container_name: m2-bigdata-dashboard
@@ -28,10 +57,14 @@ services:
       MINIO_ENDPOINT: s3:9000
       MINIO_ACCESS_KEY: root
       MINIO_SECRET_KEY: root-134
+      NESSIE_URI: http://nessie:19120/iceberg/
+      NESSIE_WAREHOUSE: warehouse
     depends_on:
       - s3
+      - nessie
 
 volumes:
   s3-data:
+  nessie-data:
   
   
