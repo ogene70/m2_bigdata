@@ -30,6 +30,12 @@ SCHEMA = Schema(
     NestedField(field_id=5, name="repository", field_type=StringType(), required=False),
     NestedField(field_id=6, name="model", field_type=StringType(), required=False),
     NestedField(field_id=7, name="message_index", field_type=IntegerType(), required=False),
+    NestedField(field_id=8, name="decision_node_id", field_type=IntegerType(), required=False),
+    NestedField(field_id=9, name="decision_parent_id", field_type=IntegerType(), required=False),
+    NestedField(field_id=10, name="decision_node_type", field_type=StringType(), required=False),
+    NestedField(field_id=11, name="decision_status", field_type=StringType(), required=False),
+    NestedField(field_id=12, name="tool_name", field_type=StringType(), required=False),
+    NestedField(field_id=13, name="tool_input", field_type=StringType(), required=False),
 )
 
 COLUMNS = [
@@ -40,6 +46,12 @@ COLUMNS = [
     "repository",
     "model",
     "message_index",
+    "decision_node_id",
+    "decision_parent_id",
+    "decision_node_type",
+    "decision_status",
+    "tool_name",
+    "tool_input",
 ]
 
 
@@ -124,8 +136,9 @@ def main():
 
     for col in df.select_dtypes(include=["datetime64", "datetimetz"]).columns:
         df[col] = pd.to_datetime(df[col], utc=True).astype("datetime64[us, UTC]")
-    if "message_index" in df.columns:
-        df["message_index"] = df["message_index"].fillna(0).astype("int32")
+    for col in ["message_index", "decision_node_id", "decision_parent_id"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0).astype("int32")
 
     arrow = pa.Table.from_pandas(df, preserve_index=False)
     table.append(arrow)
