@@ -1,5 +1,6 @@
 services:
   s3:
+    image: quay.io/minio/minio:latest
     container_name: m2-bigdata-s3
     restart: unless-stopped
     ports:
@@ -16,6 +17,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  dashboard:
+    build: ./dashboard
+    container_name: m2-bigdata-dashboard
+    restart: unless-stopped
+    ports:
+      - "4000:8501"
+    environment:
+      MINIO_ENDPOINT: s3:9000
+      MINIO_ACCESS_KEY: root
+      MINIO_SECRET_KEY: root-134
+    depends_on:
+      - s3
 
 volumes:
   s3-data:

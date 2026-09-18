@@ -129,6 +129,16 @@ At the completion of every chat session, archive the entire conversation to MinI
 
 The archive must be written as an Apache Parquet file and uploaded to the local MinIO instance.
 
+### Automatic Archival
+
+An opencode plugin automates this workflow:
+
+- Hook: `session.idle` in `.opencode/plugins/session-archive.js`
+- Core logic: `.opencode/lib/session-archive.mjs` (Parquet generation via `parquetjs-lite` + upload via `post.sh`)
+- Bucket: `sessions`
+
+The plugin runs automatically when a conversation ends. No manual step is required.
+
 ### Required Workflow
 
 1. Collect the complete conversation transcript.
