@@ -1,0 +1,32 @@
+{
+  "name": "m2_bigdata",
+  "version": "1.0.0",
+  "description": "Projet Bigdata de M2",
+  "keywords": [
+    "M2",
+    "BIG",
+    "DATA",
+    "AI"
+  ],
+  "homepage": "https://github.com/ogene70/m2_bigdata#readme",
+  "bugs": {
+    "url": "https://github.com/ogene70/m2_bigdata/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ogene70/m2_bigdata.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "docsify-cli": "^5.0.0"
+  }
+}

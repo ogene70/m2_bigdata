@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Document</title>
+  <meta name="description" content="Description">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="stylesheet" href="//cdn.jsdelivr.net/npm/docsify@5/dist/themes/core.min.css">
+  <link rel="stylesheet" href="//cdn.jsdelivr.net/npm/docsify@5/dist/themes/addons/vue.min.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    window.$docsify = {
+      name: '',
+      repo: '',
+      loadSidebar: true,
+      markdown: {
+        renderer: {
+          code: function (code, lang) {
+            if (lang === 'mermaid') {
+              const id = 'mermaid-' + Math.random().toString(36).slice(2);
+              return '<pre class="mermaid" id="' + id + '">' +
+                encodeURIComponent(code) + '</pre>';
+            }
+            return this.origin.code.apply(this, arguments);
+          }
+        }
+      }
+    };
+  </script>
+  <!-- Docsify resource -->
+  <script src="//cdn.jsdelivr.net/npm/docsify@5"></script>
+  <!-- Mermaid resource -->
+  <script src="//cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
+
+    function renderMermaid(root) {
+      const blocks = (root || document).querySelectorAll('.mermaid:not([data-processed])');
+      blocks.forEach(function (el) {
+        const src = decodeURIComponent(el.textContent);
+        const id = el.id || ('mermaid-' + Math.random().toString(36).slice(2));
+        el.removeAttribute('id');
+        mermaid.render(id, src).then(function (svg) {
+          el.innerHTML = svg;
+          el.setAttribute('data-processed', 'true');
+        }).catch(function (err) {
+          el.textContent = 'Mermaid error: ' + err.message;
+        });
+      });
+    }
+
+    // Render after docsify finishes each page, and watch for route changes
+    document.addEventListener('docsify:done', function () { renderMermaid(); });
+    new MutationObserver(function () { renderMermaid(); })
+      .observe(document.getElementById('app'), { childList: true, subtree: true });
+  </script>
+</body>
+</html>

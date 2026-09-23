@@ -113,7 +113,11 @@ services:
       <<: *spark-env
     depends_on:
       - spark-master
-
+  documentation:
+    build:
+      context: ./docs
+    pull_policy: build
+    restart: unless-stopped
 volumes:
   s3-data:
   nessie-data:
