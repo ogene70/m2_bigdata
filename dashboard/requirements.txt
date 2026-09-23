@@ -3,3 +3,6 @@ pandas
 pyarrow
 s3fs
 plotly
+pyiceberg[pyarrow]
+duckdb
+pyspark[sql]==3.5.4

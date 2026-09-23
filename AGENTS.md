@@ -171,6 +171,21 @@ Optional metadata columns:
 | model | string |
 | message_index | integer |
 
+### Decision Tree Columns
+
+Since the agent's real decisions (steps, reasoning, tool calls) must be captured, the archive also stores the conversation as a tree. Every node (message, step, reasoning, tool) is one row.
+
+| Column | Type | Meaning |
+|----------|----------|----------|
+| decision_node_id | integer | unique node id within the session |
+| decision_parent_id | integer | parent node id (`0` = root / user request) |
+| decision_node_type | string | `message`, `step`, `reasoning`, or `tool` |
+| decision_status | string | step outcome (`stop`, `tool-calls`, `started`…) or tool status (`completed`, `error`…) |
+| tool_name | string | tool used for `tool` nodes (`bash`, `glob`, …) |
+| tool_input | string | command/arguments of the tool call |
+
+`decision_node_type` is `message` for rows missing the column (legacy archives).
+
 ---
 
 ## Session Identifier
@@ -351,3 +366,4 @@ archives/20260917-132455-a7f29587.parquet
 - Do not use external cloud storage services.
 - Do not use AWS endpoints.
 - Use only the local Dockerized MinIO instance.
+- Always resume your actions after build session 
