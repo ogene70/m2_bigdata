@@ -16,9 +16,15 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "root")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "root-134")
 NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie:19120/iceberg/")
 NESSIE_WAREHOUSE = os.getenv("NESSIE_WAREHOUSE", "warehouse")
+SPARK_CONNECT_URI = os.getenv("SPARK_CONNECT_URI", "grpc://spark-connect:15002")
 ICEBERG_TABLE = "analytics.sessions"
 BUCKET = "sessions"
 REGION = "us-east-1"
+
+try:
+    from pyspark.connect import SparkSession as ConnectSparkSession
+except Exception:
+    ConnectSparkSession = None
 
 st.set_page_config(
     page_title="Sessions Dashboard",
@@ -155,6 +161,31 @@ def run_sql(sql, df, session_id=None):
         "SELECT * FROM sessions WHERE decision_node_type = 'message' OR decision_node_type IS NULL"
     )
     return con.execute(sql).fetchdf()
+
+
+def spark_connect_session():
+    if ConnectSparkSession is None:
+        raise RuntimeError("pyspark n'est pas installé dans le dashboard (requirements.txt).")
+    sess = st.session_state.get("spark_connect_session")
+    if sess is None:
+        sess = (
+            ConnectSparkSession.builder
+            .remote(SPARK_CONNECT_URI)
+            .build()
+        )
+        st.session_state["spark_connect_session"] = sess
+    return sess
+
+
+def run_spark_sql(sql, session_id=None):
+    spark = spark_connect_session()
+    sql_scoped = f"SELECT * FROM iceberg.analytics.sessions WHERE session_id = '{session_id}'" if session_id else ""
+    if sql_scoped:
+        spark.sql(f"CREATE OR REPLACE TEMP VIEW sessions AS {sql_scoped}")
+    try:
+        return spark.sql(sql).toPandas()
+    except Exception:
+        raise
 
 
 def _tree_layout(df):
@@ -849,7 +880,7 @@ with st.expander("📋 Sessions", expanded=False):
 # ---- Requête SQL ----
 st.divider()
 
-with st.expander("🛠️ Requête SQL (DuckDB sur Iceberg)", expanded=False):
+with st.expander("🛠️ Requête SQL sur Iceberg", expanded=False):
     SQL_EXAMPLES = {
         "Messages par rôle": "SELECT role, count(*) AS n FROM messages GROUP BY role ORDER BY n DESC",
         "Messages par session": "SELECT session_id, count(*) AS messages FROM messages GROUP BY session_id ORDER BY messages DESC",
@@ -859,6 +890,14 @@ with st.expander("🛠️ Requête SQL (DuckDB sur Iceberg)", expanded=False):
         "Perimetre (toutes les données)": "SELECT * FROM sessions LIMIT 10",
         "Gabarit (les 5 plus longues réponses)": "SELECT session_id, role, length(content) AS taille, left(content, 80) AS extrait FROM messages ORDER BY taille DESC LIMIT 5",
     }
+
+    engine = st.radio(
+        "Moteur",
+        ["DuckDB", "Apache Spark (connect)"],
+        horizontal=True,
+        index=0,
+        help="Spark requiert le cluster standalone (`./spark/start.sh`).",
+    )
 
     example_name = st.selectbox("Exemple", list(SQL_EXAMPLES.keys()))
     sql_text = st.text_area(
@@ -872,11 +911,25 @@ with st.expander("🛠️ Requête SQL (DuckDB sur Iceberg)", expanded=False):
 
     if run_clicked and sql_text.strip():
         try:
-            result = run_sql(sql_text, df, session_id=(None if show_all else selected_id))
-            st.success(f"Requête exécutée — {len(result)} ligne(s)")
+            if engine.startswith("Apache"):
+                result = run_spark_sql(sql_text, session_id=(None if show_all else selected_id))
+                st.success(
+                    f"Requête exécutée sur Spark — {len(result)} ligne(s) "
+                    f"({SPARK_CONNECT_URI})"
+                )
+            else:
+                result = run_sql(sql_text, df, session_id=(None if show_all else selected_id))
+                st.success(f"Requête exécutée sur DuckDB — {len(result)} ligne(s)")
             st.dataframe(result, use_container_width=True, hide_index=True)
         except Exception as e:
-            st.error(f"Échec de la requête : {e}")
+            msg = str(e)
+            if "SparkConnect" in msg or "pyspark" in msg.lower() or "not installed" in msg.lower():
+                st.error(
+                    "Spark Connect est indisponible. Lancez `./spark/start.sh` "
+                    f"puis rafraîchissez. Détail : {e}"
+                )
+            else:
+                st.error(f"Échec de la requête : {e}")
     elif run_clicked and not sql_text.strip():
         st.warning("Requête SQL vide.")
 
@@ -891,17 +944,74 @@ else:
 with st.expander(chat_title, expanded=True):
     if show_all:
         chat_messages = filtered.sort_values(["timestamp", "message_index"])
+        chat_tree = tree_filtered
     else:
         chat_messages = msg_df[msg_df["session_id"] == selected_id].sort_values("message_index")
+        chat_tree = tree_filtered
 
-    for _, row in chat_messages.iterrows():
-        is_user = row.get("role") == "user"
+    chat_mode = st.radio(
+        "Affichage",
+        ["📚 Regroupé par demande", "📜 Complet", "🎯 Réponses finales"],
+        horizontal=True,
+        index=0,
+    )
+
+    def _chat_bubble(row, extra=""):
+        is_user = str(row.get("role")) == "user"
         author = "🧑‍💻 User" if is_user else "🤖 Assistant"
         model = row.get("model") or ""
         ts = pd.to_datetime(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
-        extra = f"session `{row['session_id']}` · " if show_all else ""
+        prefix = f"session `{row['session_id']}` · " if show_all else extra
         with st.chat_message("user" if is_user else "assistant"):
-            st.caption(f"{extra}{author} · {ts}" + (f" · {model}" if model else ""))
-            st.markdown(row["content"])
+            st.caption(f"{prefix}{author} · {ts}" + (f" · {model}" if model else ""))
+            st.markdown(str(row.get("content") or ""))
+
+    if chat_mode.startswith("📚"):
+        turns = []
+        pending_user, pending_asst = None, []
+        for _, row in chat_messages.iterrows():
+            if str(row.get("role")) == "user":
+                turns.append((pending_user, pending_asst))
+                pending_user, pending_asst = row, []
+            else:
+                pending_asst.append(row)
+        turns.append((pending_user, pending_asst))
+
+        for user_row, assts in turns:
+            if user_row is not None:
+                _chat_bubble(user_row)
+            if assts:
+                first_ts = pd.to_datetime(assts[0]["timestamp"]).strftime("%H:%M")
+                last_ts = pd.to_datetime(assts[-1]["timestamp"]).strftime("%H:%M")
+                joined = "\n\n---\n\n".join(
+                    str(r["content"]).strip() for r in assts if str(r["content"]).strip()
+                )
+                with st.chat_message("assistant"):
+                    st.caption(f"🤖 Assistant · {len(assts)} tour(s) fusionné(s) · {first_ts} → {last_ts}")
+                    st.markdown(joined or "_— sans texte —_")
+    elif chat_mode.startswith("🎯"):
+        stop_ids = set()
+        if "decision_node_type" in chat_tree.columns:
+            steps = chat_tree[chat_tree["decision_node_type"] == "step"]
+            for _, srow in steps.iterrows():
+                if str(srow.get("decision_status")) == "stop":
+                    pid = srow.get("decision_parent_id")
+                    if pid is not None and pd.notna(pid):
+                        stop_ids.add(int(pid))
+        if stop_ids:
+            finals = chat_messages[
+                chat_messages["decision_node_id"].notna()
+                & chat_messages["decision_node_id"].astype(int).isin(stop_ids)
+            ]
+        else:
+            finals = pd.DataFrame(columns=chat_messages.columns)
+        if finals.empty:
+            st.info("Aucune réponse finale (`stop`) pour ce filtre — données antérieures aux décisions ?")
+        else:
+            for _, row in finals.iterrows():
+                _chat_bubble(row)
+    else:  # 📜 Complet
+        for _, row in chat_messages.iterrows():
+            _chat_bubble(row)
 
     st.caption("--- Fin de la conversation ---")

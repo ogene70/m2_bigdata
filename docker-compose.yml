@@ -1,3 +1,7 @@
+x-spark-env: &spark-env
+  ICEBERG_VERSION: "1.11.0"
+  AWS_REGION: us-east-1
+
 services:
   s3:
     image: quay.io/minio/minio:latest
@@ -59,9 +63,56 @@ services:
       MINIO_SECRET_KEY: root-134
       NESSIE_URI: http://nessie:19120/iceberg/
       NESSIE_WAREHOUSE: warehouse
+      SPARK_CONNECT_URI: grpc://spark-connect:15002
     depends_on:
       - s3
       - nessie
+      - spark-connect
+
+  spark-master:
+    build: ./spark
+    pull_policy: build
+    container_name: m2-bigdata-spark-master
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      <<: *spark-env
+      SPARK_MODE: master
+    depends_on:
+      - s3
+      - nessie
+
+  spark-worker:
+    build: ./spark
+    pull_policy: build
+    restart: unless-stopped
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      <<: *spark-env
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 2g
+    depends_on:
+      - spark-master
+
+  spark-connect:
+    build: ./spark
+    pull_policy: build
+    container_name: m2-bigdata-spark-connect
+    restart: unless-stopped
+    ports:
+      - "15002:15002"
+    command:
+      - /bin/bash
+      - -c
+      - 'until (echo > /dev/tcp/spark-master/7077) 2>/dev/null; do echo "waiting for spark-master..."; sleep 2; done; exec /opt/spark/bin/spark-submit --class org.apache.spark.sql.connect.service.SparkConnectServer --name "Spark Connect server" --master spark://spark-master:7077 spark-internal'
+    environment:
+      <<: *spark-env
+    depends_on:
+      - spark-master
 
 volumes:
   s3-data:
