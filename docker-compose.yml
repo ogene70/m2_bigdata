@@ -63,7 +63,7 @@ services:
       MINIO_SECRET_KEY: root-134
       NESSIE_URI: http://nessie:19120/iceberg/
       NESSIE_WAREHOUSE: warehouse
-      SPARK_CONNECT_URI: grpc://spark-connect:15002
+      SPARK_CONNECT_URI: sc://spark-connect:15002
     depends_on:
       - s3
       - nessie
@@ -118,8 +118,110 @@ services:
       context: ./docs
     pull_policy: build
     restart: unless-stopped
+    ports:
+      - "2000:80"
+  minio-init:
+    image: quay.io/minio/minio:latest
+    container_name: m2-bigdata-minio-init
+    depends_on:
+      s3:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://s3:9000 root root-134 >/dev/null
+        mc mb -p local/sessions >/dev/null 2>&1 || true
+        mc mb -p local/warehouse >/dev/null 2>&1 || true
+        mc mb -p local/data >/dev/null 2>&1 || true
+        echo "buckets ready"
+    restart: "no"
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
+    container_name: m2-bigdata-redpanda
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+      - "8081:8081"
+      - "9644:9644"
+    command:
+      - redpanda
+      - start
+      - --smp
+      - "1"
+      - --memory
+      - 512M
+      - --overprovisioned
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - PLAIN://0.0.0.0:9092,PLAIN://0.0.0.0:9093
+      - --advertise-kafka-addr
+      - PLAIN://redpanda:9092,PLAIN://localhost:9093
+      - --rpc-addr
+      - 0.0.0.0:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --schema-registry-addr
+      - PLAIN://0.0.0.0:8081
+      - --set
+      - redpanda.auto_create_topics_enabled=true
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v3.11.0
+    container_name: m2-bigdata-redpanda-console
+    restart: unless-stopped
+    ports:
+      - "10080:8080"
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      CONSOLE_SCHEMA_REGISTRY_ENABLED: "true"
+      CONSOLE_SCHEMA_REGISTRY_URLS: http://redpanda:8081
+    depends_on:
+      - redpanda
+
+  redpanda-connect-archive:
+    build: ./redpanda-connect
+    container_name: m2-bigdata-redpanda-connect-archive
+    restart: unless-stopped
+    entrypoint: ["/redpanda-connect"]
+    command: ["run", "/config/s3-archive.yaml"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  iceberg-ingest:
+    build: ./spark
+    pull_policy: build
+    container_name: m2-bigdata-iceberg-ingest
+    restart: unless-stopped
+    command:
+      - /bin/bash
+      - -c
+      - 'until (echo > /dev/tcp/spark-master/7077) 2>/dev/null; do echo "waiting for spark-master..."; sleep 2; done; exec /opt/spark/bin/spark-submit --master spark://spark-master:7077 --name "Iceberg ingest" /opt/spark/jobs/ingest-sessions.py'
+    environment:
+      <<: *spark-env
+    depends_on:
+      spark-master:
+        condition: service_started
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
 volumes:
   s3-data:
   nessie-data:
-  
-  
+  redpanda-data:
+

@@ -2,7 +2,6 @@ import io
 import os
 from datetime import datetime
 
-import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -16,13 +15,13 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "root")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "root-134")
 NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie:19120/iceberg/")
 NESSIE_WAREHOUSE = os.getenv("NESSIE_WAREHOUSE", "warehouse")
-SPARK_CONNECT_URI = os.getenv("SPARK_CONNECT_URI", "grpc://spark-connect:15002")
+SPARK_CONNECT_URI = os.getenv("SPARK_CONNECT_URI", "sc://spark-connect:15002")
 ICEBERG_TABLE = "analytics.sessions"
 BUCKET = "sessions"
 REGION = "us-east-1"
 
 try:
-    from pyspark.connect import SparkSession as ConnectSparkSession
+    from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
 except Exception:
     ConnectSparkSession = None
 
@@ -87,8 +86,14 @@ def sanitize_timestamps(df):
         return df
     valid = (secs >= 946684800) & (secs <= 4102444800)
     if not valid.all():
-        df = df[valid].copy()
-    restored = pd.to_datetime(secs, unit="s", utc=True)
+        rescaled = secs[~valid] / 1e3
+        recovered = (rescaled >= 946684800) & (rescaled <= 4102444800)
+        if recovered.any():
+            secs.loc[~valid] = secs.loc[~valid].where(~recovered, rescaled)
+        valid = (secs >= 946684800) & (secs <= 4102444800)
+    df = df[valid].copy()
+    secs = secs[valid]
+    restored = pd.to_datetime(secs.round(), unit="s", utc=True)
     df["timestamp"] = restored
     return df
 
@@ -115,52 +120,20 @@ def load_iceberg_sessions():
         cat = iceberg_catalog()
         table = cat.load_table(ICEBERG_TABLE)
         df = table.scan().to_arrow().to_pandas()
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-        return df
+        return sanitize_timestamps(df)
     except (NoSuchTableError, FileNotFoundError, RuntimeError, ValueError, OSError):
         return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_resource(show_spinner=False)
-def get_duckdb():
-    con = duckdb.connect(database=":memory:")
-    con.execute("SET unsafe_enable_version_guessing = true;")
-    con.execute(
-        "CREATE SECRET minio ("
-        f"TYPE S3, KEY_ID '{MINIO_ACCESS_KEY}', SECRET '{MINIO_SECRET_KEY}', "
-        f"REGION '{REGION}', ENDPOINT '{MINIO_ENDPOINT}', "
-        f"URL_STYLE 'path', USE_SSL false)"
-    )
-    return con
-
-
-@st.cache_data(show_spinner=False, ttl=60)
-def iceberg_location():
+def load_iceberg_spark():
     try:
-        cat = iceberg_catalog()
-        return cat.load_table(ICEBERG_TABLE).location()
+        spark = spark_connect_session()
+        df = spark.sql(f"SELECT * FROM iceberg.{ICEBERG_TABLE}").toPandas()
+        return sanitize_timestamps(df)
     except Exception:
-        return None
-
-
-def run_sql(sql, df, session_id=None):
-    con = get_duckdb()
-    loc = iceberg_location()
-    if loc:
-        base = f"SELECT * FROM iceberg_scan('{loc}')"
-    else:
-        con.register("df", df)
-        base = "SELECT * FROM df"
-    where = f" WHERE session_id = '{session_id}'" if session_id else ""
-    con.execute(f"CREATE OR REPLACE TEMP VIEW sessions AS {base}{where}")
-    con.execute(
-        "CREATE OR REPLACE TEMP VIEW messages AS "
-        "SELECT * FROM sessions WHERE decision_node_type = 'message' OR decision_node_type IS NULL"
-    )
-    return con.execute(sql).fetchdf()
+        return pd.DataFrame()
 
 
 def spark_connect_session():
@@ -171,7 +144,7 @@ def spark_connect_session():
         sess = (
             ConnectSparkSession.builder
             .remote(SPARK_CONNECT_URI)
-            .build()
+            .getOrCreate()
         )
         st.session_state["spark_connect_session"] = sess
     return sess
@@ -179,9 +152,12 @@ def spark_connect_session():
 
 def run_spark_sql(sql, session_id=None):
     spark = spark_connect_session()
-    sql_scoped = f"SELECT * FROM iceberg.analytics.sessions WHERE session_id = '{session_id}'" if session_id else ""
-    if sql_scoped:
-        spark.sql(f"CREATE OR REPLACE TEMP VIEW sessions AS {sql_scoped}")
+    sql_scoped = f"SELECT * FROM iceberg.analytics.sessions WHERE session_id = '{session_id}'" if session_id else "SELECT * FROM iceberg.analytics.sessions"
+    spark.sql(f"CREATE OR REPLACE TEMP VIEW sessions AS {sql_scoped}")
+    spark.sql(
+        "CREATE OR REPLACE TEMP VIEW messages AS "
+        "SELECT * FROM sessions WHERE decision_node_type = 'message' OR decision_node_type IS NULL"
+    )
     try:
         return spark.sql(sql).toPandas()
     except Exception:
@@ -591,28 +567,36 @@ color2name = {
 fs = get_s3_filesystem()
 parquet_paths = list_parquet_paths(fs)
 
-df = load_iceberg_sessions()
-from_iceberg = not df.empty
+with st.spinner("Chargement des sessions via Spark/Iceberg..."):
+    df = load_iceberg_spark()
+source_label = "Spark/Iceberg"
+source_hint = f"Table Iceberg : `iceberg.{ICEBERG_TABLE}`"
 
-st.sidebar.title("📊 Sessions")
-if from_iceberg:
-    source_label = "Iceberg"
-    st.sidebar.caption(f"Table Iceberg : `{ICEBERG_TABLE}`")
-else:
-    source_label = "MinIO (parquet)"
-    st.sidebar.caption(f"Bucket : `{BUCKET}` ({len(parquet_paths)} fichier(s))")
+if df.empty:
+    with st.spinner("Chargement des sessions via PyIceberg..."):
+        df = load_iceberg_sessions()
+    if not df.empty:
+        source_label = "PyIceberg"
+        source_hint = f"Table Iceberg : `{ICEBERG_TABLE}`"
 
 if df.empty and parquet_paths:
     with st.spinner("Chargement des sessions depuis MinIO (parquet)..."):
         df = load_all_sessions(tuple(parquet_paths))
+    source_label = "MinIO (parquet)"
+    source_hint = f"Bucket : `{BUCKET}` ({len(parquet_paths)} fichier(s))"
 
 if df.empty:
     st.warning("Aucune donnée de session trouvée.")
-    if from_iceberg:
-        st.info("Exécutez `./iceberg-ingest.sh` après avoir archivé des sessions.")
-    else:
-        st.info("Démarrez des conversations et elles seront archivées automatiquement.")
+    st.info(
+        "Terminez des conversations opencode : elles sont archivées sur Redpanda "
+        "puis synchronisées vers Iceberg et MinIO automatiquement. "
+        "Requis : cluster Spark démarré (`./spark/start.sh`) et `docker compose up -d`."
+    )
     st.stop()
+
+st.sidebar.title("📊 Sessions")
+st.sidebar.caption(f"Source : **{source_label}**")
+st.sidebar.caption(source_hint)
 
 # ---- Normalisation des colonnes "arbre décisionnel" ----
 DECISION_COLS = [
@@ -891,14 +875,6 @@ with st.expander("🛠️ Requête SQL sur Iceberg", expanded=False):
         "Gabarit (les 5 plus longues réponses)": "SELECT session_id, role, length(content) AS taille, left(content, 80) AS extrait FROM messages ORDER BY taille DESC LIMIT 5",
     }
 
-    engine = st.radio(
-        "Moteur",
-        ["DuckDB", "Apache Spark (connect)"],
-        horizontal=True,
-        index=0,
-        help="Spark requiert le cluster standalone (`./spark/start.sh`).",
-    )
-
     example_name = st.selectbox("Exemple", list(SQL_EXAMPLES.keys()))
     sql_text = st.text_area(
         "Écrivez votre requête SQL",
@@ -911,15 +887,11 @@ with st.expander("🛠️ Requête SQL sur Iceberg", expanded=False):
 
     if run_clicked and sql_text.strip():
         try:
-            if engine.startswith("Apache"):
-                result = run_spark_sql(sql_text, session_id=(None if show_all else selected_id))
-                st.success(
-                    f"Requête exécutée sur Spark — {len(result)} ligne(s) "
-                    f"({SPARK_CONNECT_URI})"
-                )
-            else:
-                result = run_sql(sql_text, df, session_id=(None if show_all else selected_id))
-                st.success(f"Requête exécutée sur DuckDB — {len(result)} ligne(s)")
+            result = run_spark_sql(sql_text, session_id=(None if show_all else selected_id))
+            st.success(
+                f"Requête exécutée sur Spark — {len(result)} ligne(s) "
+                f"({SPARK_CONNECT_URI})"
+            )
             st.dataframe(result, use_container_width=True, hide_index=True)
         except Exception as e:
             msg = str(e)

@@ -244,36 +244,43 @@ export function cleanupFile(filePath) {
   } catch {}
 }
 
-export async function uploadToMinio({ parquetPath, bucket = BUCKET, objectKey, workspaceDir }) {
-  const postSh = join(workspaceDir, "post.sh")
-  const args = [parquetPath, bucket, objectKey]
-  const result = await runScript(postSh, args, workspaceDir)
-  if (result.exitCode !== 0) {
-    const err = new Error(result.stderr || `post.sh exited with ${result.exitCode}`)
-    err.exitCode = result.exitCode
-    err.stdout = result.stdout
-    err.stderr = result.stderr
-    throw err
-  }
-  return { bucket, objectKey, status: "uploaded", stdout: result.stdout }
+export const REDPANDA_TOPIC = "sessions"
+
+export function redpandaBrokers() {
+  const value = process.env.REDPANDA_BROKERS || "localhost:9092"
+  return value.split(",").map((s) => s.trim()).filter(Boolean)
 }
 
-async function runScript(scriptPath, args, cwd) {
-  const { spawn } = await import("node:child_process")
-  const command = process.platform === "win32" ? "bash.exe" : "bash"
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, [scriptPath, ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] })
-    let stdout = ""
-    let stderr = ""
-    let errored = null
-    child.stdout.on("data", (chunk) => (stdout += chunk.toString()))
-    child.stderr.on("data", (chunk) => (stderr += chunk.toString()))
-    child.on("error", (err) => {
-      errored = err
-      reject(new Error(`Failed to run ${command}: ${err.message}`))
+export async function publishToRedpanda(rows, { brokers = redpandaBrokers(), topic = REDPANDA_TOPIC } = {}) {
+  const { Kafka, TopicAlreadyExistsError } = await import("kafkajs")
+  const client = new Kafka({ clientId: "session-archive", brokers })
+  const admin = client.admin()
+  await admin.connect()
+  try {
+    await admin.createTopics({
+      topics: [{ topic, numPartitions: 1 }],
+      waitForLeaders: true,
     })
-    child.on("close", (exitCode) => {
-      if (!errored) resolve({ exitCode, stdout, stderr })
-    })
-  })
+  } catch (err) {
+    if (!(err instanceof TopicAlreadyExistsError)) {
+      throw new Error(`Failed to create topic ${topic}: ${err?.message || err}`)
+    }
+  } finally {
+    await admin.disconnect()
+  }
+
+  const producer = client.producer({ allowAutoTopicCreation: false })
+  await producer.connect()
+  try {
+    for (const row of rows) {
+      await producer.send({
+        topic,
+        messages: [{ key: row.session_id, value: JSON.stringify(row) }],
+      })
+    }
+  } finally {
+    await producer.disconnect()
+  }
+
+  return { topic, count: rows.length, status: "published" }
 }

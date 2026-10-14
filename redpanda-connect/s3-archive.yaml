@@ -1,0 +1,57 @@
+input:
+  redpanda:
+    seed_brokers: ["redpanda:9092"]
+    topics: ["sessions"]
+    consumer_group: s3-archive
+    auto_replay_nacks: true
+
+pipeline:
+  processors:
+    - mapping: |
+        meta session_id = this.session_id
+
+output:
+  aws_s3:
+    bucket: sessions
+    region: us-east-1
+    endpoint: http://s3:9000
+    force_path_style_urls: true
+    credentials:
+      id: root
+      secret: root-134
+    content_type: application/x-parquet
+    path: '${! now().ts_format("2006/01/02") }/${! meta("session_id") }-${! uuid_v4() }.parquet'
+    batching:
+      count: 0
+      period: 10s
+      processors:
+        - parquet_encode:
+            default_compression: snappy
+            default_timestamp_unit: MILLISECOND
+            schema:
+              - name: session_id
+                type: UTF8
+              - name: timestamp
+                type: TIMESTAMP
+              - name: role
+                type: UTF8
+              - name: content
+                type: UTF8
+              - name: repository
+                type: UTF8
+              - name: model
+                type: UTF8
+              - name: message_index
+                type: INT32
+              - name: decision_node_id
+                type: INT32
+              - name: decision_parent_id
+                type: INT32
+              - name: decision_node_type
+                type: UTF8
+              - name: decision_status
+                type: UTF8
+              - name: tool_name
+                type: UTF8
+              - name: tool_input
+                type: UTF8

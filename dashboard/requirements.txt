@@ -4,5 +4,4 @@ pyarrow
 s3fs
 plotly
 pyiceberg[pyarrow]
-duckdb
-pyspark[sql]==3.5.4
+pyspark[sql,connect]==3.5.4

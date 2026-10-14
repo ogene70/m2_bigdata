@@ -11,17 +11,17 @@
 <body>
   <div id="app"></div>
   <script>
+    let num = 0;
     window.$docsify = {
       name: '',
       repo: '',
       loadSidebar: true,
       markdown: {
         renderer: {
-          code: function (code, lang) {
+          code: function ({ text, lang }) {
             if (lang === 'mermaid') {
-              const id = 'mermaid-' + Math.random().toString(36).slice(2);
-              return '<pre class="mermaid" id="' + id + '">' +
-                encodeURIComponent(code) + '</pre>';
+              return '<div class="mermaid">' +
+                mermaid.render('mermaid-svg-' + num++, text) + '</div>';
             }
             return this.origin.code.apply(this, arguments);
           }
@@ -32,29 +32,9 @@
   <!-- Docsify resource -->
   <script src="//cdn.jsdelivr.net/npm/docsify@5"></script>
   <!-- Mermaid resource -->
-  <script src="//cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="//cdn.jsdelivr.net/npm/mermaid@9.3.0/dist/mermaid.min.js"></script>
   <script>
     mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
-
-    function renderMermaid(root) {
-      const blocks = (root || document).querySelectorAll('.mermaid:not([data-processed])');
-      blocks.forEach(function (el) {
-        const src = decodeURIComponent(el.textContent);
-        const id = el.id || ('mermaid-' + Math.random().toString(36).slice(2));
-        el.removeAttribute('id');
-        mermaid.render(id, src).then(function (svg) {
-          el.innerHTML = svg;
-          el.setAttribute('data-processed', 'true');
-        }).catch(function (err) {
-          el.textContent = 'Mermaid error: ' + err.message;
-        });
-      });
-    }
-
-    // Render after docsify finishes each page, and watch for route changes
-    document.addEventListener('docsify:done', function () { renderMermaid(); });
-    new MutationObserver(function () { renderMermaid(); })
-      .observe(document.getElementById('app'), { childList: true, subtree: true });
   </script>
 </body>
 </html>
