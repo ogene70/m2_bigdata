@@ -23,7 +23,7 @@ output:
     path: '${! now().ts_format("2006/01/02") }/${! meta("session_id") }-${! uuid_v4() }.parquet'
     batching:
       count: 0
-      period: 10s
+      period: 300ms
       processors:
         - parquet_encode:
             default_compression: snappy
@@ -54,4 +54,10 @@ output:
               - name: tool_name
                 type: UTF8
               - name: tool_input
+                type: UTF8
+              - name: tokens_in
+                type: INT32
+              - name: tokens_out
+                type: INT32
+              - name: harness
                 type: UTF8

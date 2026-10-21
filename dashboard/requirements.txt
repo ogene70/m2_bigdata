@@ -1,6 +1,7 @@
 streamlit
 pandas
-pyarrow
+numpy>=1.26,<2
+pyarrow>=14,<17
 s3fs
 plotly
 pyiceberg[pyarrow]

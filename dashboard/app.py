@@ -1,5 +1,6 @@
 import io
 import os
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -31,6 +32,22 @@ st.set_page_config(
     layout="wide",
 )
 
+_REFRESH_SECONDS = float(os.getenv("DASHBOARD_REFRESH_SECONDS", "2"))
+
+
+@st.fragment(run_every=_REFRESH_SECONDS)
+def _autorefresh():
+    last = st.session_state.get("_last_autorefresh", 0.0)
+    now = time.time()
+    if now - last >= _REFRESH_SECONDS * 0.9:
+        st.session_state["_last_autorefresh"] = now
+        st.rerun(scope="app")
+
+
+if _REFRESH_SECONDS > 0:
+    _autorefresh()
+
+
 
 def get_fs():
     fs = s3fs.S3FileSystem(
@@ -57,7 +74,7 @@ def list_parquet_paths(fs):
         return []
 
 
-@st.cache_data(show_spinner=False, ttl=60)
+@st.cache_data(show_spinner=False, ttl=1)
 def load_all_sessions(paths):
     fs = get_s3_filesystem()
     frames = []
@@ -74,6 +91,82 @@ def load_all_sessions(paths):
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _to_epoch(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.timestamp()
+    except Exception:
+        return 0.0
+
+
+def list_parquet_objects(fs):
+    prefix = f"{BUCKET}/"
+    result = {}
+    try:
+        found = fs.find(prefix, detail=True)
+    except Exception:
+        try:
+            found = {p: {} for p in fs.find(prefix)}
+        except Exception:
+            return result
+    if isinstance(found, dict):
+        for path, info in found.items():
+            if path.endswith(".parquet"):
+                result[path] = _to_epoch((info or {}).get("LastModified"))
+    else:
+        for path in found:
+            if path.endswith(".parquet"):
+                result[path] = 0.0
+    return result
+
+
+@st.cache_resource
+def _parquet_df_cache():
+    return {}
+
+
+def load_live_sessions():
+    """Lit directement les Parquet du bucket sessions (source live, sans Spark)."""
+    fs = get_s3_filesystem()
+    objs = list_parquet_objects(fs)
+    if not objs:
+        return pd.DataFrame()
+    cache = _parquet_df_cache()
+    frames = []
+    seen = set()
+    for path, mtime in objs.items():
+        key = (path, mtime)
+        seen.add(key)
+        cached = cache.get(key)
+        if cached is None:
+            try:
+                with fs.open(path, "rb") as f:
+                    cached = pd.read_parquet(io.BytesIO(f.read()))
+            except Exception:
+                continue
+            cache[key] = cached
+        df = cached.copy()
+        df["object_key"] = path
+        df["_mtime"] = mtime
+        frames.append(df)
+    for stale in [k for k in cache if k not in seen]:
+        cache.pop(stale, None)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df = sanitize_timestamps(df)
+    dedup_cols = [c for c in ("session_id", "decision_node_id") if c in df.columns]
+    if "_mtime" in df.columns and dedup_cols:
+        df = df.sort_values("_mtime").drop_duplicates(subset=dedup_cols, keep="last")
+    return df.drop(columns=["_mtime"], errors="ignore")
 
 
 def sanitize_timestamps(df):
@@ -98,6 +191,10 @@ def sanitize_timestamps(df):
     return df
 
 
+def summarize_text(text, max_len=100):
+    t = "" if text is None else str(text).strip()
+    return t[:max_len] + "..." if len(t) > max_len else t
+
 def iceberg_catalog():
     return load_catalog(
         "nessie",
@@ -114,7 +211,7 @@ def iceberg_catalog():
     )
 
 
-@st.cache_data(show_spinner=False, ttl=60)
+@st.cache_data(show_spinner=False, ttl=1)
 def load_iceberg_sessions():
     try:
         cat = iceberg_catalog()
@@ -565,12 +662,24 @@ color2name = {
 
 
 fs = get_s3_filesystem()
-parquet_paths = list_parquet_paths(fs)
+parquet_objects = list_parquet_objects(fs)
 
-with st.spinner("Chargement des sessions via Spark/Iceberg..."):
-    df = load_iceberg_spark()
-source_label = "Spark/Iceberg"
-source_hint = f"Table Iceberg : `iceberg.{ICEBERG_TABLE}`"
+df = pd.DataFrame()
+source_label = ""
+source_hint = ""
+
+with st.spinner("Chargement live depuis MinIO (parquet)..."):
+    df = load_live_sessions()
+if not df.empty:
+    source_label = "MinIO parquet (live)"
+    source_hint = f"Bucket : `{BUCKET}` ({len(parquet_objects)} fichier(s))"
+
+if df.empty:
+    with st.spinner("Chargement des sessions via Spark/Iceberg..."):
+        df = load_iceberg_spark()
+    if not df.empty:
+        source_label = "Spark/Iceberg"
+        source_hint = f"Table Iceberg : `iceberg.{ICEBERG_TABLE}`"
 
 if df.empty:
     with st.spinner("Chargement des sessions via PyIceberg..."):
@@ -579,18 +688,13 @@ if df.empty:
         source_label = "PyIceberg"
         source_hint = f"Table Iceberg : `{ICEBERG_TABLE}`"
 
-if df.empty and parquet_paths:
-    with st.spinner("Chargement des sessions depuis MinIO (parquet)..."):
-        df = load_all_sessions(tuple(parquet_paths))
-    source_label = "MinIO (parquet)"
-    source_hint = f"Bucket : `{BUCKET}` ({len(parquet_paths)} fichier(s))"
-
 if df.empty:
     st.warning("Aucune donnée de session trouvée.")
     st.info(
-        "Terminez des conversations opencode : elles sont archivées sur Redpanda "
-        "puis synchronisées vers Iceberg et MinIO automatiquement. "
-        "Requis : cluster Spark démarré (`./spark/start.sh`) et `docker compose up -d`."
+        "Aucune archive détectée dans Iceberg ni dans MinIO. "
+        "Les conversations opencode sont archivées sur Redpanda (topic `sessions`) "
+        "puis synchronisées vers Iceberg (`analytics.sessions`) et MinIO (bucket `sessions`) "
+        "via Redpanda Connect et le job Spark `iceberg-ingest`."
     )
     st.stop()
 
@@ -611,6 +715,10 @@ for _c in DECISION_COLS:
     if _c not in df.columns:
         df[_c] = None
 df["decision_node_type"] = df["decision_node_type"].fillna("message")
+
+if "harness" not in df.columns:
+    df["harness"] = None
+df["harness"] = df["harness"].fillna("inconnu").replace("", "inconnu")
 
 msg_mask = df["decision_node_type"].eq("message")
 msg_df = df[msg_mask].copy()
@@ -662,6 +770,16 @@ if role_filter:
     filtered = filtered[filtered["role"].isin(role_filter)]
     tree_filtered = tree_filtered[tree_filtered["role"].isin(role_filter)]
 
+harness_opts = sorted([h for h in filtered["harness"].dropna().unique() if h])
+harness_filter = st.sidebar.multiselect(
+    "Harnais",
+    options=harness_opts,
+    default=harness_opts,
+)
+if harness_filter:
+    filtered = filtered[filtered["harness"].isin(harness_filter)]
+    tree_filtered = tree_filtered[tree_filtered["harness"].isin(harness_filter)]
+
 # Applique la session sélectionnée à tout le dashboard (KPI, graphiques,
 # table, arbre et requêtes SQL).
 if not show_all:
@@ -671,11 +789,13 @@ if not show_all:
 # ---- Header ----
 st.title("📊 Tableau de bord des sessions")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Sessions", filtered["session_id"].nunique())
 c2.metric("Messages", len(filtered))
 c3.metric("Modèles", filtered["model"].dropna().nunique() if "model" in filtered.columns else 0)
 c4.metric("Dépôts", filtered["repository"].dropna().nunique() if "repository" in filtered.columns else 0)
+c5.metric("Tokens In", f"{int(filtered['tokens_in'].sum()):,}" if "tokens_in" in filtered.columns else "N/A")
+c6.metric("Tokens Out", f"{int(filtered['tokens_out'].sum()):,}" if "tokens_out" in filtered.columns else "N/A")
 
 st.divider()
 
@@ -733,6 +853,156 @@ with col_d:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Aucune donnée")
+
+st.divider()
+
+# ---- Comparaison des harnais ----
+with st.expander("🔀 Comparaison des harnais", expanded=True):
+    if "harness" not in filtered.columns:
+        st.info("Aucune donnée de harnais dans le Lakehouse.")
+    else:
+        available = sorted([h for h in filtered["harness"].dropna().unique() if h])
+
+        def _sum_col(col, frame):
+            return int(frame[col].fillna(0).sum()) if col in frame.columns else 0
+
+        summary_rows = []
+        for h in available:
+            g = filtered[filtered["harness"] == h]
+            if g.empty:
+                continue
+            spans = g.groupby("session_id")["timestamp"].agg(
+                lambda s: (s.max() - s.min()).total_seconds()
+            )
+            duration = float(spans.sum())
+            models = sorted({m for m in g["model"].dropna().unique() if m})
+            summary_rows.append({
+                "Harnais": h,
+                "Sessions": int(g["session_id"].nunique()),
+                "Messages": int(len(g)),
+                "Tokens In": _sum_col("tokens_in", g),
+                "Tokens Out": _sum_col("tokens_out", g),
+                "Durée (min)": round(duration / 60, 1),
+                "Modèles": ", ".join(models) if models else "—",
+            })
+        summary = pd.DataFrame(summary_rows)
+
+        if "decision_node_type" in tree_filtered.columns and not tree_filtered.empty:
+            nt = (
+                tree_filtered.groupby(["harness", "decision_node_type"])
+                .size()
+                .unstack(fill_value=0)
+            )
+            for c in ["message", "step", "reasoning", "tool"]:
+                if c not in nt.columns:
+                    nt[c] = 0
+            nt = nt[["message", "step", "reasoning", "tool"]]
+            nt.columns = ["Msgs", "Étapes", "Raisonn.", "Outils"]
+            summary = summary.merge(
+                nt, left_on="Harnais", right_index=True, how="left"
+            ).fillna(0)
+            for c in ["Msgs", "Étapes", "Raisonn.", "Outils"]:
+                summary[c] = summary[c].astype(int)
+
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        cA, cB = st.columns(2)
+        with cA:
+            st.markdown("**Tokens par harnais**")
+            if {"Tokens In", "Tokens Out"}.issubset(summary.columns) and not summary.empty:
+                tok = summary.melt(
+                    id_vars="Harnais",
+                    value_vars=["Tokens In", "Tokens Out"],
+                    var_name="sens",
+                    value_name="tokens",
+                )
+                fig = px.bar(tok, x="Harnais", y="tokens", color="sens", barmode="group")
+                fig.update_layout(height=340, legend_title_text="")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Aucune donnée")
+        with cB:
+            st.markdown("**Répartition des nœuds par harnais**")
+            node_cols = [
+                c for c in ["Msgs", "Étapes", "Raisonn.", "Outils"] if c in summary.columns
+            ]
+            if node_cols and not summary.empty:
+                nt2 = summary.melt(
+                    id_vars="Harnais",
+                    value_vars=node_cols,
+                    var_name="type",
+                    value_name="count",
+                )
+                fig = px.bar(nt2, x="Harnais", y="count", color="type", barmode="stack")
+                fig.update_layout(height=340, legend_title_text="")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Aucune donnée")
+
+        st.markdown(
+            "**Temps de réponse de l'agent** — Δt entre une demande utilisateur "
+            "et le message de l'agent qui la suit, par session."
+        )
+        resp_src = filtered.sort_values(["session_id", "timestamp"]).copy()
+        if not resp_src.empty:
+            resp_src["_prev_ts"] = resp_src.groupby("session_id")["timestamp"].shift(1)
+            resp_src["_dt"] = (
+                resp_src["timestamp"] - resp_src["_prev_ts"]
+            ).dt.total_seconds()
+            resp = resp_src[resp_src["role"].eq("assistant")].dropna(subset=["_dt"])
+            if not resp.empty:
+                agg = (
+                    resp.groupby("harness")["_dt"]
+                    .agg(["count", "mean", "median", "max"])
+                    .reset_index()
+                )
+                agg.columns = ["Harnais", "Réponses mesurées", "Moyenne (s)", "Médiane (s)", "Max (s)"]
+                for c in ["Moyenne (s)", "Médiane (s)", "Max (s)"]:
+                    agg[c] = agg[c].round(2)
+                st.dataframe(agg, use_container_width=True, hide_index=True)
+                fig = px.box(resp, x="harness", y="_dt", points="all")
+                fig.update_layout(height=340, xaxis_title="Harnais", yaxis_title="Δt (s)")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Pas assez de paires demande/réponse pour mesurer le temps de réponse.")
+
+st.divider()
+
+# ---- Analyse des Tokens ----
+with st.expander("🪙 Analyse des Tokens", expanded=False):
+    if "tokens_in" not in df.columns or "tokens_out" not in df.columns:
+        st.info("Les données de tokens ne sont pas encore disponibles dans le Lakehouse.")
+    else:
+        token_df = filtered[["session_id", "timestamp", "role", "model", "harness", "tokens_in", "tokens_out", "content"]].copy()
+        token_df = token_df.sort_values("timestamp")
+        
+        # Calcul des totaux
+        total_in = token_df["tokens_in"].sum()
+        total_out = token_df["tokens_out"].sum()
+        
+        col_t1, col_t2 = st.columns(2)
+        col_t1.metric("Total Input Tokens", f"{int(total_in):,}")
+        col_t2.metric("Total Output Tokens", f"{int(total_out):,}")
+        
+        st.subheader("Détail par interaction")
+        # Nettoyage pour l'affichage
+        display_df = token_df.copy()
+        display_df["content"] = display_df["content"].apply(lambda x: summarize_text(x, 100))
+        
+        st.dataframe(
+            display_df.rename(columns={
+                "session_id": "Session",
+                "timestamp": "Heure",
+                "role": "Rôle",
+                "model": "Modèle",
+                "harness": "Harnais",
+                "tokens_in": "Tokens Entrée",
+                "tokens_out": "Tokens Sortie",
+                "content": "Extrait"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
 
 st.divider()
 

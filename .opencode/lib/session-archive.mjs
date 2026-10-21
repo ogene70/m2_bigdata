@@ -20,6 +20,9 @@ export const SCHEMA = new parquet.ParquetSchema({
   decision_status: { type: "UTF8", optional: true },
   tool_name: { type: "UTF8", optional: true },
   tool_input: { type: "UTF8", optional: true },
+  tokens_in: { type: "INT32", optional: true },
+  tokens_out: { type: "INT32", optional: true },
+  harness: { type: "UTF8", optional: true },
 })
 
 export const NODE_MESSAGE = "message"
@@ -62,6 +65,9 @@ function node({
   status = "",
   tool = "",
   input = "",
+  tokensIn = null,
+  tokensOut = null,
+  harness = "",
 }) {
   return {
     session_id: sessionId,
@@ -77,10 +83,13 @@ function node({
     decision_status: status,
     tool_name: tool,
     tool_input: input,
+    tokens_in: tokensIn,
+    tokens_out: tokensOut,
+    harness: harness,
   }
 }
 
-export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
+export function buildRows(rawMessages, { sessionId, repository = "", harness = "pi" } = {}) {
   const rows = []
   let messageIndex = 0
   let nextNodeId = 1
@@ -97,6 +106,10 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
     const model = role === "assistant"
       ? `${info.providerID || ""}/${info.modelID || ""}`
       : ""
+
+    const usage = info.usage || entry?.usage || {}
+    const tokensIn = usage.prompt_tokens ?? usage.input_tokens ?? null
+    const tokensOut = usage.completion_tokens ?? usage.output_tokens ?? null
 
     const textParts = parts
       .filter((p) => p.type === "text" && p.text)
@@ -118,6 +131,9 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
       nodeId: messageNodeId,
       parentId,
       nodeType: NODE_MESSAGE,
+      tokensIn,
+      tokensOut,
+      harness,
     }))
 
     if (role === "user") lastUserNodeId = messageNodeId
@@ -139,6 +155,7 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
           parentId: messageNodeId,
           nodeType: NODE_STEP,
           status: "started",
+          harness,
         }))
       } else if (type === "reasoning") {
         if (stepNodeId === null) {
@@ -155,6 +172,7 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
             parentId: messageNodeId,
             nodeType: NODE_STEP,
             status: "considering",
+            harness,
           }))
         }
         rows.push(node({
@@ -168,6 +186,7 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
           nodeId: nextNodeId++,
           parentId: stepNodeId,
           nodeType: NODE_REASONING,
+          harness,
         }))
       } else if (type === "tool") {
         if (stepNodeId === null) {
@@ -184,6 +203,7 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
             parentId: messageNodeId,
             nodeType: NODE_STEP,
             status: "acting",
+            harness,
           }))
         }
         const state = part?.state || {}
@@ -208,6 +228,7 @@ export function buildRows(rawMessages, { sessionId, repository = "" } = {}) {
           status: String(state.status || "running"),
           tool: String(part?.tool || ""),
           input: toolInput,
+          harness,
         }))
       } else if (type === "step-finish") {
         if (stepNodeId !== null) {
@@ -251,7 +272,22 @@ export function redpandaBrokers() {
   return value.split(",").map((s) => s.trim()).filter(Boolean)
 }
 
-export async function publishToRedpanda(rows, { brokers = redpandaBrokers(), topic = REDPANDA_TOPIC } = {}) {
+export function hashRow(row) {
+  return JSON.stringify(row)
+}
+
+let topicEnsured = null
+let producerHolder = null
+
+export function resetProducer() {
+  const holder = producerHolder
+  producerHolder = null
+  if (holder) holder.producer.disconnect().catch(() => {})
+}
+
+async function ensureTopic(topic, brokers) {
+  const key = `${brokers.join(",")}|${topic}`
+  if (topicEnsured === key) return
   const { Kafka, TopicAlreadyExistsError } = await import("kafkajs")
   const client = new Kafka({ clientId: "session-archive", brokers })
   const admin = client.admin()
@@ -268,19 +304,30 @@ export async function publishToRedpanda(rows, { brokers = redpandaBrokers(), top
   } finally {
     await admin.disconnect()
   }
+  topicEnsured = key
+}
 
+async function getProducer(brokers) {
+  const key = brokers.join(",")
+  if (producerHolder && producerHolder.key === key) return producerHolder.producer
+  const { Kafka } = await import("kafkajs")
+  const client = new Kafka({ clientId: "session-archive", brokers })
   const producer = client.producer({ allowAutoTopicCreation: false })
   await producer.connect()
-  try {
-    for (const row of rows) {
-      await producer.send({
-        topic,
-        messages: [{ key: row.session_id, value: JSON.stringify(row) }],
-      })
-    }
-  } finally {
-    await producer.disconnect()
-  }
+  producerHolder = { key, producer }
+  return producer
+}
 
+export async function publishToRedpanda(rows, { brokers = redpandaBrokers(), topic = REDPANDA_TOPIC } = {}) {
+  if (rows.length === 0) return { topic, count: 0, status: "published" }
+  await ensureTopic(topic, brokers)
+  const producer = await getProducer(brokers)
+  const messages = rows.map((row) => ({ key: row.session_id, value: JSON.stringify(row) }))
+  try {
+    await producer.send({ topic, messages })
+  } catch (err) {
+    resetProducer()
+    throw err
+  }
   return { topic, count: rows.length, status: "published" }
 }

@@ -69,6 +69,8 @@ services:
       - nessie
       - spark-connect
 
+
+
   spark-master:
     build: ./spark
     pull_policy: build
@@ -93,8 +95,8 @@ services:
     environment:
       <<: *spark-env
       SPARK_MODE: worker
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_CORES: "4"
+      SPARK_WORKER_MEMORY: 4g
     depends_on:
       - spark-master
 
@@ -108,7 +110,7 @@ services:
     command:
       - /bin/bash
       - -c
-      - 'until (echo > /dev/tcp/spark-master/7077) 2>/dev/null; do echo "waiting for spark-master..."; sleep 2; done; exec /opt/spark/bin/spark-submit --class org.apache.spark.sql.connect.service.SparkConnectServer --name "Spark Connect server" --master spark://spark-master:7077 spark-internal'
+      - 'until (echo > /dev/tcp/spark-master/7077) 2>/dev/null; do echo "waiting for spark-master..."; sleep 2; done; exec /opt/spark/bin/spark-submit --class org.apache.spark.sql.connect.service.SparkConnectServer --name "Spark Connect server" --master spark://spark-master:7077 --conf spark.cores.max=2 spark-internal'
     environment:
       <<: *spark-env
     depends_on:
