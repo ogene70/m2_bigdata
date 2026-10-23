@@ -42,10 +42,25 @@ CREATE TABLE IF NOT EXISTS iceberg.analytics.sessions (
     tool_input string,
     tokens_in int,
     tokens_out int,
-    harness string
+    harness string,
+    topic string
 ) USING iceberg
 """
 )
+
+# Tables creees avant l'introduction de la colonne `topic` : on l'ajoute.
+try:
+    spark.sql("ALTER TABLE iceberg.analytics.sessions ADD COLUMNS (topic string)")
+except Exception:
+    pass
+
+# Partitionnement par jour : un MERGE ne touche alors que les fichiers des jours
+# concernes au lieu de scanner toute la table. Sans effet sur les donnees deja
+# ecrites (evolution du spec de partitionnement).
+try:
+    spark.sql("ALTER TABLE iceberg.analytics.sessions ADD PARTITION FIELD days(`timestamp`)")
+except Exception:
+    pass
 
 schema = StructType(
     [
@@ -65,6 +80,7 @@ schema = StructType(
         StructField("tokens_in", IntegerType(), True),
         StructField("tokens_out", IntegerType(), True),
         StructField("harness", StringType(), True),
+        StructField("topic", StringType(), True),
     ]
 )
 
@@ -72,49 +88,25 @@ stream = (
     spark.readStream.format("parquet")
     .schema(schema)
     .option("pathGlobFilter", "*.parquet")
-    .option("maxFilesPerTrigger", 50)
+    .option("maxFilesPerTrigger", 100)
     .option("maxFileAgeMs", 1577847600000)
     .load("s3a://sessions/*/*/*/")
-    .select(F.col("*"), F.input_file_name().alias("_file"))
 )
 
 
-def _file_mtimes(files):
-    jvm = spark._jvm
-    hadoop_conf = spark._jsc.hadoopConfiguration()
-    path_cls = jvm.org.apache.hadoop.fs.Path
-    result = {}
-    for file_path in files:
-        try:
-            path = path_cls(file_path)
-            fs = path.getFileSystem(hadoop_conf)
-            result[file_path] = int(fs.getFileStatus(path).getModificationTime())
-        except Exception:
-            result[file_path] = 0
-    return result
-
-
 def upsert_to_iceberg(batch_df, batch_id):
-    files = list({row[0] for row in batch_df.select("_file").collect()})
-    if not files:
-        return
-    mtimes_map = _file_mtimes(files)
-
-    def _lookup(path):
-        return mtimes_map.get(path, 0)
-
-    lookup_udf = F.udf(_lookup, "long")
+    # Une seule fenetre suffit : l'ordre par timestamp desc garantit le "dernier
+    # ecrit gagne" (deux republications d'un meme noeud -> la plus recente gagne).
     deduped = (
-        batch_df.withColumn("_mod_ts", lookup_udf(F.col("_file")))
-        .withColumn(
+        batch_df.withColumn(
             "_rn",
             F.row_number().over(
                 Window.partitionBy("session_id", "decision_node_id")
-                .orderBy(F.col("_mod_ts").desc())
+                .orderBy(F.col("timestamp").desc(), F.col("message_index").desc())
             ),
         )
         .filter(F.col("_rn") == 1)
-        .drop("_rn", "_mod_ts", "_file")
+        .drop("_rn")
     )
     sess = batch_df.sparkSession
     sess.conf.set("spark.sql.shuffle.partitions", "4")
@@ -126,8 +118,31 @@ def upsert_to_iceberg(batch_df, batch_id):
         USING sessions_stage AS s
         ON  t.session_id = s.session_id
         AND t.decision_node_id = s.decision_node_id
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        WHEN MATCHED THEN UPDATE SET
+            t.`timestamp` = s.`timestamp`,
+            t.role = s.role,
+            t.content = s.content,
+            t.repository = s.repository,
+            t.model = s.model,
+            t.message_index = s.message_index,
+            t.decision_parent_id = s.decision_parent_id,
+            t.decision_node_type = s.decision_node_type,
+            t.decision_status = s.decision_status,
+            t.tool_name = s.tool_name,
+            t.tool_input = s.tool_input,
+            t.tokens_in = s.tokens_in,
+            t.tokens_out = s.tokens_out,
+            t.harness = s.harness,
+            t.topic = s.topic
+        WHEN NOT MATCHED THEN INSERT (
+            session_id, `timestamp`, role, content, repository, model, message_index,
+            decision_node_id, decision_parent_id, decision_node_type, decision_status,
+            tool_name, tool_input, tokens_in, tokens_out, harness, topic
+        ) VALUES (
+            s.session_id, s.`timestamp`, s.role, s.content, s.repository, s.model, s.message_index,
+            s.decision_node_id, s.decision_parent_id, s.decision_node_type, s.decision_status,
+            s.tool_name, s.tool_input, s.tokens_in, s.tokens_out, s.harness, s.topic
+        )
         """
     )
 
@@ -135,7 +150,7 @@ def upsert_to_iceberg(batch_df, batch_id):
 query = (
     stream.writeStream.foreachBatch(upsert_to_iceberg)
     .option("checkpointLocation", "s3a://warehouse/_checkpoints/iceberg-ingest")
-    .trigger(processingTime="1 second")
+    .trigger(processingTime="10 seconds")
     .start()
 )
 

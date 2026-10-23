@@ -64,6 +64,7 @@ services:
       NESSIE_URI: http://nessie:19120/iceberg/
       NESSIE_WAREHOUSE: warehouse
       SPARK_CONNECT_URI: sc://spark-connect:15002
+      DASHBOARD_REFRESH_SECONDS: "5"
     depends_on:
       - s3
       - nessie
@@ -158,9 +159,9 @@ services:
       - --node-id
       - "0"
       - --kafka-addr
-      - PLAIN://0.0.0.0:9092,PLAIN://0.0.0.0:9093
+      - PLAIN://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
       - --advertise-kafka-addr
-      - PLAIN://redpanda:9092,PLAIN://localhost:9093
+      - PLAIN://redpanda:9092,EXTERNAL://localhost:9093
       - --rpc-addr
       - 0.0.0.0:33145
       - --advertise-rpc-addr
@@ -203,6 +204,59 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  topic-push:
+    build: ./topic-push
+    container_name: m2-bigdata-topic-push
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: "8090"
+      MAX_EVENTS_PER_SESSION: "500"
+      MAX_SESSIONS: "50"
+    depends_on:
+      - redpanda
+
+  arroyo:
+    build: ./arroyo
+    container_name: m2-bigdata-arroyo
+    restart: unless-stopped
+    ports:
+      - "5115:5115"
+    environment:
+      ARROYO__DATABASE__TYPE: sqlite
+      ARROYO__DATABASE__SQLITE__PATH: /var/lib/arroyo/arroyo.sqlite
+      ARROYO__CHECKPOINT_URL: file:///var/lib/arroyo/checkpoints
+      ARROYO__COMPILER__ARTIFACT_URL: file:///var/lib/arroyo/artifacts
+      ARROYO__DISABLE_TELEMETRY: "true"
+    volumes:
+      - arroyo-data:/var/lib/arroyo
+    depends_on:
+      - redpanda
+
+  arroyo-init:
+    build: ./arroyo
+    container_name: m2-bigdata-arroyo-init
+    restart: "no"
+    entrypoint: ["/bin/bash", "/opt/arroyo/init.sh"]
+    environment:
+      ARROYO_API: http://arroyo:5115/api/v1
+      PIPELINE_NAME: session-topics
+    depends_on:
+      arroyo:
+        condition: service_started
+      topic-push:
+        condition: service_started
+
+  dashboard-html:
+    build: ./dashboard-html
+    container_name: m2-bigdata-dashboard-html
+    restart: unless-stopped
+    ports:
+      - "4001:80"
+    depends_on:
+      - topic-push
+
   iceberg-ingest:
     build: ./spark
     pull_policy: build
@@ -222,8 +276,27 @@ services:
       minio-init:
         condition: service_completed_successfully
 
+  iceberg-maintenance:
+    build: ./spark
+    pull_policy: build
+    container_name: m2-bigdata-iceberg-maintenance
+    restart: unless-stopped
+    # local[1] : la compaction ne consomme pas les coeurs du cluster.
+    command:
+      - /bin/bash
+      - -c
+      - 'while true; do /opt/spark/bin/spark-submit --master local[1] --name "Iceberg maintenance" /opt/spark/jobs/maintain-sessions.py; sleep 1800; done'
+    environment:
+      <<: *spark-env
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
 volumes:
   s3-data:
   nessie-data:
   redpanda-data:
+  arroyo-data:
 

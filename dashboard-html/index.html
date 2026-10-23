@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sujets de session — temps réel</title>
+<style>
+  :root {
+    --bg: #0b0f16;
+    --panel: #121a26;
+    --panel-2: #0e141d;
+    --border: #1e2a3a;
+    --text: #e6edf3;
+    --muted: #8b9bb0;
+    --accent: #4da3ff;
+    --accent-2: #7ee787;
+    --warn: #ffa657;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 20% -10%, #16243a 0%, var(--bg) 55%);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 14px 22px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(11, 15, 22, .72);
+    backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: .2px; font-size: 15px; }
+  .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  .spacer { flex: 1; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel-2);
+    font-size: 12px; color: var(--muted); white-space: nowrap;
+  }
+  .pill.live { color: var(--accent-2); border-color: rgba(126,231,135,.35); }
+  .pill.live .led { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-2); animation: pulse 1.6s infinite; }
+  .pill.down { color: var(--warn); border-color: rgba(255,166,87,.35); }
+  .pill.down .led { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1);} 50% { opacity: .35; transform: scale(.8);} }
+  select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 12.5px; max-width: 340px;
+  }
+  .stat { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+  .stat b { color: var(--text); font-weight: 620; font-variant-numeric: tabular-nums; }
+  main {
+    flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 380px;
+    gap: 18px; padding: 18px 22px 28px; align-items: start;
+  }
+  @media (max-width: 1080px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .panel {
+    background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px;
+  }
+  .panel h2 {
+    margin: 0 0 12px; font-size: 12px; font-weight: 600; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .timeline-scroll { overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
+  svg { display: block; }
+  .axis { stroke: var(--border); stroke-width: 2; }
+  .node-hit { cursor: pointer; }
+  .node-dot { fill: var(--accent); stroke: #0b0f16; stroke-width: 2; transition: r .12s ease; }
+  .node-hit:hover .node-dot { fill: var(--accent-2); r: 8; }
+  .node-label { fill: var(--text); font-size: 11.5px; }
+  .node-time { fill: var(--muted); font-size: 10px; }
+  .node-line { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 3; }
+  .empty { color: var(--muted); font-size: 13px; padding: 26px 4px; text-align: center; }
+  .detail-topic { font-size: 16px; font-weight: 620; margin: 0 0 4px; }
+  .detail-meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .detail-body {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; color: var(--muted); font-size: 12.5px;
+    white-space: pre-wrap; word-break: break-word; max-height: 230px; overflow: auto;
+  }
+  .topics { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 46vh; overflow: auto; }
+  .topics li {
+    display: flex; gap: 10px; align-items: baseline; padding: 8px 10px;
+    border: 1px solid transparent; border-radius: 8px; cursor: pointer; background: var(--panel-2);
+  }
+  .topics li:hover { border-color: var(--border); }
+  .topics li.active { border-color: var(--accent); background: rgba(77,163,255,.08); }
+  .topics .idx { color: var(--muted); font-size: 11px; min-width: 22px; font-variant-numeric: tabular-nums; }
+  .topics .txt { flex: 1; font-size: 13px; }
+  .topics .time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  footer { color: var(--muted); font-size: 11.5px; padding: 0 22px 16px; }
+  code { background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span> Sujets de session</div>
+  <span class="pill" id="status"><span class="led"></span><span id="status-text">connexion…</span></span>
+  <div class="spacer"></div>
+  <select id="session" title="Session"></select>
+  <span class="stat"><b id="count">0</b> sujets</span>
+  <span class="stat">durée <b id="span">—</b></span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Frise chronologique</h2>
+    <div class="timeline-scroll" id="timeline-scroll">
+      <svg id="timeline" width="100%" height="240"></svg>
+    </div>
+    <div class="empty" id="timeline-empty">En attente du premier sujet…</div>
+  </section>
+
+  <aside class="panel">
+    <h2>Détail</h2>
+    <div id="detail">
+      <p class="detail-topic">—</p>
+      <div class="detail-meta">Sélectionnez un sujet sur la frise.</div>
+    </div>
+    <h2 style="margin-top:18px">Sujets</h2>
+    <ul class="topics" id="topics"><li class="empty" style="padding:14px">Aucun sujet.</li></ul>
+  </aside>
+</main>
+
+<footer>
+  opencode → Redpanda (<code>sessions</code>) → Arroyo → push SSE → ce dashboard.
+</footer>
+
+<script>
+(function () {
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const state = {
+    sessions: new Map(),
+    selected: null,
+    follow: true,
+    activeKey: null,
+  };
+
+  const el = {
+    status: document.getElementById("status"),
+    statusText: document.getElementById("status-text"),
+    session: document.getElementById("session"),
+    count: document.getElementById("count"),
+    span: document.getElementById("span"),
+    timeline: document.getElementById("timeline"),
+    timelineScroll: document.getElementById("timeline-scroll"),
+    timelineEmpty: document.getElementById("timeline-empty"),
+    detail: document.getElementById("detail"),
+    topics: document.getElementById("topics"),
+  };
+
+  function setLive(live) {
+    el.status.className = "pill " + (live ? "live" : "down");
+    el.statusText.textContent = live ? "live" : "reconnexion…";
+  }
+
+  function fmtTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "--:--:--";
+    return d.toLocaleTimeString("fr-FR", { hour12: false });
+  }
+
+  function fmtDuration(ms) {
+    if (!isFinite(ms) || ms <= 0) return "—";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + " s";
+    const m = Math.floor(s / 60);
+    return m + " min " + String(s % 60).padStart(2, "0") + " s";
+  }
+
+  function keyOf(event) {
+    return event.session_id + ":" + event.message_index;
+  }
+
+  function sortedEvents(session) {
+    if (!session) return [];
+    return session.events.slice().sort(function (a, b) {
+      if (a.message_index !== b.message_index) return a.message_index - b.message_index;
+      return a.timestamp < b.timestamp ? -1 : 1;
+    });
+  }
+
+  function upsertSession(sessionId) {
+    if (!state.sessions.has(sessionId)) {
+      state.sessions.set(sessionId, { session_id: sessionId, events: [], last_seen: null });
+    }
+    return state.sessions.get(sessionId);
+  }
+
+  function mergeEvent(event) {
+    if (!event || !event.session_id) return;
+    const session = upsertSession(event.session_id);
+    const idx = session.events.findIndex(function (e) {
+      return e.message_index === event.message_index;
+    });
+    if (idx >= 0) session.events[idx] = event;
+    else session.events.push(event);
+    session.events.sort(function (a, b) { return a.message_index - b.message_index; });
+    session.last_seen = event.received_at || event.timestamp;
+  }
+
+  function renderSelector() {
+    const sessions = Array.from(state.sessions.values()).sort(function (a, b) {
+      const la = a.last_seen || "";
+      const lb = b.last_seen || "";
+      return la < lb ? 1 : -1;
+    });
+    const previous = state.selected;
+    el.session.innerHTML = "";
+    if (!sessions.length) {
+      const opt = document.createElement("option");
+      opt.textContent = "aucune session";
+      el.session.appendChild(opt);
+      return;
+    }
+    sessions.forEach(function (session) {
+      const opt = document.createElement("option");
+      opt.value = session.session_id;
+      opt.textContent = session.session_id + " (" + session.events.length + ")";
+      el.session.appendChild(opt);
+    });
+    if (previous && state.sessions.has(previous)) {
+      el.session.value = previous;
+      state.selected = previous;
+    } else {
+      state.selected = sessions[0].session_id;
+      el.session.value = state.selected;
+    }
+  }
+
+  function renderTimeline() {
+    const events = sortedEvents(state.sessions.get(state.selected));
+    el.timelineEmpty.style.display = events.length ? "none" : "block";
+    el.timeline.innerHTML = "";
+
+    if (!events.length) {
+      el.timeline.setAttribute("height", "0");
+      return;
+    }
+
+    const margin = { top: 46, right: 34, bottom: 42, left: 34 };
+    const rowHeight = 30;
+    const width = Math.max(760, events.length * 118 + margin.left + margin.right);
+    const height = margin.top + rowHeight + margin.bottom;
+    el.timeline.setAttribute("viewBox", "0 0 " + width + " " + height);
+    el.timeline.setAttribute("width", width);
+    el.timeline.setAttribute("height", height);
+
+    const times = events.map(function (e) { return new Date(e.timestamp).getTime(); });
+    const valid = times.filter(function (t) { return isFinite(t); });
+    const min = valid.length ? Math.min.apply(null, valid) : 0;
+    const max = valid.length ? Math.max.apply(null, valid) : 0;
+    const span = max - min;
+
+    const axisY = margin.top + rowHeight / 2;
+    const usable = width - margin.left - margin.right;
+    const positions = events.map(function (_, i) {
+      if (span > 0) {
+        return margin.left + ((times[i] - min) / span) * usable;
+      }
+      return margin.left + (usable / Math.max(1, events.length - 1)) * i;
+    });
+
+    const axis = document.createElementNS(SVG_NS, "line");
+    axis.setAttribute("class", "axis");
+    axis.setAttribute("x1", margin.left);
+    axis.setAttribute("x2", width - margin.right);
+    axis.setAttribute("y1", axisY);
+    axis.setAttribute("y2", axisY);
+    el.timeline.appendChild(axis);
+
+    events.forEach(function (event, i) {
+      const x = positions[i];
+      const above = i % 2 === 0;
+      const labelY = above ? axisY - 16 : axisY + 26;
+      const tickY = above ? axisY - 6 : axisY + 6;
+
+      const stem = document.createElementNS(SVG_NS, "line");
+      stem.setAttribute("class", "node-line");
+      stem.setAttribute("x1", x);
+      stem.setAttribute("x2", x);
+      stem.setAttribute("y1", axisY);
+      stem.setAttribute("y2", tickY);
+      el.timeline.appendChild(stem);
+
+      const group = document.createElementNS(SVG_NS, "g");
+      group.setAttribute("class", "node-hit");
+
+      const circle = document.createElementNS(SVG_NS, "circle");
+      circle.setAttribute("class", "node-dot");
+      circle.setAttribute("cx", x);
+      circle.setAttribute("cy", axisY);
+      circle.setAttribute("r", 6);
+      group.appendChild(circle);
+
+      const title = document.createElementNS(SVG_NS, "title");
+      title.textContent = event.topic + " — " + fmtTime(event.timestamp);
+      group.appendChild(title);
+
+      const label = document.createElementNS(SVG_NS, "text");
+      label.setAttribute("class", "node-label");
+      label.setAttribute("x", x);
+      label.setAttribute("y", labelY);
+      label.setAttribute("text-anchor", "middle");
+      label.textContent = event.topic.length > 24 ? event.topic.slice(0, 23) + "…" : event.topic;
+      group.appendChild(label);
+
+      const time = document.createElementNS(SVG_NS, "text");
+      time.setAttribute("class", "node-time");
+      time.setAttribute("x", x);
+      time.setAttribute("y", labelY + (above ? -12 : 12));
+      time.setAttribute("text-anchor", "middle");
+      time.textContent = fmtTime(event.timestamp);
+      group.appendChild(time);
+
+      group.addEventListener("click", function () {
+        state.activeKey = keyOf(event);
+        render();
+      });
+
+      el.timeline.appendChild(group);
+    });
+  }
+
+  function renderDetail() {
+    const events = sortedEvents(state.sessions.get(state.selected));
+    const event = events.find(function (e) { return keyOf(e) === state.activeKey; }) || events[events.length - 1];
+    if (!event) {
+      el.detail.innerHTML = '<p class="detail-topic">—</p><div class="detail-meta">Sélectionnez un sujet sur la frise.</div>';
+      return;
+    }
+    const body = (event.content || "").trim();
+    el.detail.innerHTML =
+      '<p class="detail-topic"></p><div class="detail-meta"></div><div class="detail-body"></div>';
+    el.detail.querySelector(".detail-topic").textContent = event.topic;
+    el.detail.querySelector(".detail-meta").textContent =
+      fmtTime(event.timestamp) + " · tour " + event.message_index + " · " + event.session_id;
+    el.detail.querySelector(".detail-body").textContent = body || "(message non disponible)";
+  }
+
+  function renderTopics() {
+    const events = sortedEvents(state.sessions.get(state.selected));
+    el.topics.innerHTML = "";
+    if (!events.length) {
+      el.topics.innerHTML = '<li class="empty" style="padding:14px">Aucun sujet.</li>';
+      return;
+    }
+    events.forEach(function (event, i) {
+      const li = document.createElement("li");
+      if (keyOf(event) === state.activeKey) li.className = "active";
+      const idx = document.createElement("span");
+      idx.className = "idx";
+      idx.textContent = "#" + (i + 1);
+      const txt = document.createElement("span");
+      txt.className = "txt";
+      txt.textContent = event.topic;
+      const time = document.createElement("span");
+      time.className = "time";
+      time.textContent = fmtTime(event.timestamp);
+      li.appendChild(idx);
+      li.appendChild(txt);
+      li.appendChild(time);
+      li.addEventListener("click", function () {
+        state.activeKey = keyOf(event);
+        render();
+      });
+      el.topics.appendChild(li);
+    });
+  }
+
+  function renderStats() {
+    const events = sortedEvents(state.sessions.get(state.selected));
+    el.count.textContent = events.length;
+    if (!events.length) {
+      el.span.textContent = "—";
+      return;
+    }
+    const first = new Date(events[0].timestamp).getTime();
+    const last = new Date(events[events.length - 1].timestamp).getTime();
+    el.span.textContent = fmtDuration(last - first);
+  }
+
+  function render() {
+    renderSelector();
+    renderStats();
+    renderTimeline();
+    renderDetail();
+    renderTopics();
+  }
+
+  el.session.addEventListener("change", function () {
+    state.selected = el.session.value;
+    state.follow = false;
+    state.activeKey = null;
+    render();
+  });
+
+  function connect() {
+    const source = new EventSource("/events");
+    source.onopen = function () { setLive(true); };
+    source.onerror = function () { setLive(false); };
+    source.onmessage = function (message) {
+      let payload;
+      try { payload = JSON.parse(message.data); } catch { return; }
+      if (payload.type === "snapshot") {
+        state.sessions = new Map();
+        (payload.sessions || []).forEach(function (session) {
+          state.sessions.set(session.session_id, {
+            session_id: session.session_id,
+            events: session.events || [],
+            last_seen: session.last_seen,
+          });
+        });
+        render();
+        return;
+      }
+      if (payload.type === "topic") {
+        const event = payload.event;
+        mergeEvent(event);
+        if (state.follow || !state.selected) {
+          state.selected = event.session_id;
+          state.activeKey = keyOf(event);
+        }
+        render();
+        const scroll = el.timelineScroll;
+        scroll.scrollLeft = scroll.scrollWidth;
+      }
+    };
+  }
+
+  setLive(false);
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -26,7 +26,8 @@ COPY conf/spark-defaults.conf conf/spark-env.sh /opt/spark/conf/
 RUN chown 185:185 /opt/spark/conf/spark-defaults.conf /opt/spark/conf/spark-env.sh
 
 COPY jobs/ingest-sessions.py /opt/spark/jobs/ingest-sessions.py
-RUN chmod 755 /opt/spark/jobs/ingest-sessions.py
+COPY jobs/maintain-sessions.py /opt/spark/jobs/maintain-sessions.py
+RUN chmod 755 /opt/spark/jobs/ingest-sessions.py /opt/spark/jobs/maintain-sessions.py
 
 USER 185
 

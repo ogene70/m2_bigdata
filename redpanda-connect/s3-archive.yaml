@@ -9,6 +9,8 @@ pipeline:
   processors:
     - mapping: |
         meta session_id = this.session_id
+        root = this
+        root.topic = this.topic.or("")
 
 output:
   aws_s3:
@@ -22,11 +24,14 @@ output:
     content_type: application/x-parquet
     path: '${! now().ts_format("2006/01/02") }/${! meta("session_id") }-${! uuid_v4() }.parquet'
     batching:
-      count: 0
-      period: 300ms
+      # Regroupe ~15 s de lignes par objet Parquet (au lieu d'un fichier de
+      # ~5 Ko toutes les 300 ms). Un plafond de lignes evite les tres gros
+      # batchs lors d'un rejeu. zstd reduit le volume de ~30 % face a snappy.
+      count: 2000
+      period: 15s
       processors:
         - parquet_encode:
-            default_compression: snappy
+            default_compression: zstd
             default_timestamp_unit: MILLISECOND
             schema:
               - name: session_id
@@ -60,4 +65,6 @@ output:
               - name: tokens_out
                 type: INT32
               - name: harness
+                type: UTF8
+              - name: topic
                 type: UTF8

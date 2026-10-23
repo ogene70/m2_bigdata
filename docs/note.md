@@ -20,3 +20,6 @@ Dans l'approche moderne de la BI, l'enjeux c'est la fiabilité du bigdata car on
 Ce qui permet d'etre plus resilent dans la création des KPI
 
 Moyenne - Median = lorsqu'on a des valeurs extremes il faut prendre la median au lieu de la moyenne. 
+
+
+fe_oa_0752cc124703f114ca77823f9d2d1f654f78f95bbcb2cf03

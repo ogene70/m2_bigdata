@@ -2,7 +2,8 @@ import parquet from "parquetjs-lite"
 import { mkdirSync, unlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { randomUUID } from "node:crypto"
+import { randomUUID, createHash } from "node:crypto"
+import { lookup } from "node:dns/promises"
 
 export const BUCKET = "sessions"
 
@@ -23,12 +24,31 @@ export const SCHEMA = new parquet.ParquetSchema({
   tokens_in: { type: "INT32", optional: true },
   tokens_out: { type: "INT32", optional: true },
   harness: { type: "UTF8", optional: true },
+  topic: { type: "UTF8", optional: true },
 })
 
 export const NODE_MESSAGE = "message"
 export const NODE_STEP = "step"
 export const NODE_REASONING = "reasoning"
 export const NODE_TOOL = "tool"
+
+// Roles derives du type de message OpenCode V2 (API /api/session/{id}/context).
+const ROLE_BY_TYPE = {
+  user: "user",
+  assistant: "assistant",
+  synthetic: "system",
+  system: "system",
+  skill: "system",
+  shell: "system",
+  compaction: "system",
+  "agent.selected": "system",
+  "model.selected": "system",
+  "location.switched": "system",
+}
+
+export function hashText(text) {
+  return createHash("sha1").update(String(text ?? "")).digest("hex").slice(0, 16)
+}
 
 function pad(n) {
   return String(n).padStart(2, "0")
@@ -68,6 +88,7 @@ function node({
   tokensIn = null,
   tokensOut = null,
   harness = "",
+  topic = "",
 }) {
   return {
     session_id: sessionId,
@@ -86,40 +107,148 @@ function node({
     tokens_in: tokensIn,
     tokens_out: tokensOut,
     harness: harness,
+    topic: topic,
   }
 }
 
-export function buildRows(rawMessages, { sessionId, repository = "", harness = "pi" } = {}) {
+function messageContent(msg) {
+  switch (msg?.type) {
+    case "user":
+    case "synthetic":
+    case "system":
+      return String(msg.text ?? "")
+    case "skill":
+      return `${msg.name ?? msg.skill ?? "skill"}: ${msg.text ?? ""}`
+    case "shell":
+      return String(msg.command ?? "")
+    case "agent.selected":
+      return `agent: ${msg.agent ?? ""}`
+    case "model.selected":
+      return `model: ${msg.model?.providerID ?? ""}/${msg.model?.id ?? ""}`
+    case "location.switched":
+      return `location: ${msg.location ?? ""}`
+    case "assistant": {
+      const items = Array.isArray(msg.content) ? msg.content : []
+      return items
+        .filter((item) => item?.type === "text" && item.text)
+        .map((item) => item.text)
+        .join("\n")
+    }
+    default:
+      return ""
+  }
+}
+
+function lookupTopic(topics, ordinal, text) {
+  if (!topics || typeof topics.get !== "function") return ""
+  return topics.get(`ord:${ordinal}`) || topics.get(`txt:${hashText(text)}`) || ""
+}
+
+function normalizeText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim()
+}
+
+/**
+ * La compaction retire les messages utilisateur du transcript : le contexte ne
+ * contient plus que le resume et les messages assistant. Les prompts observes
+ * en direct (`session.inbox.enqueued`) sont donc re-injectes pour conserver la
+ * racine de l'arbre et le sujet. La correspondance se fait sur le texte pour
+ * ne jamais dupliquer un prompt deja present.
+ */
+function missingPrompts(messages, prompts) {
+  if (!Array.isArray(prompts) || prompts.length === 0) return []
+  const available = []
+  for (const msg of messages ?? []) {
+    if (String(msg?.type ?? "") !== "user") continue
+    available.push(normalizeText(msg?.text))
+  }
+  const extra = []
+  for (const prompt of prompts) {
+    const text = normalizeText(prompt?.text)
+    if (!text) continue
+    const index = available.indexOf(text)
+    if (index >= 0) {
+      available.splice(index, 1)
+      continue
+    }
+    extra.push({
+      type: "user",
+      text: String(prompt?.text ?? ""),
+      time: { created: Number.isFinite(prompt?.created) ? prompt.created : Date.now() },
+    })
+  }
+  extra.sort((a, b) => (a.time.created ?? 0) - (b.time.created ?? 0))
+  return extra
+}
+
+/**
+ * Construit les lignes d'archive a partir des messages OpenCode V2
+ * (`ctx.session.context({ sessionID })`).
+ *
+ * Arbre de decision :
+ *   message (user)            parent = 0
+ *     message (assistant)     parent = dernier message utilisateur
+ *       step                  parent = message assistant
+ *         reasoning | tool    parent = step
+ */
+export function buildRows(
+  messages,
+  { sessionId, repository = "", harness = "opencode", topics = null, prompts = null } = {},
+) {
+  const transcript = Array.isArray(messages) ? messages : []
+  const injected = missingPrompts(transcript, prompts)
+  const effective = injected.length > 0 ? [...injected, ...transcript] : transcript
   const rows = []
   let messageIndex = 0
   let nextNodeId = 1
   let lastUserNodeId = 0
+  let lastMessageNodeId = 0
+  let userOrdinal = 0
 
-  for (const entry of rawMessages || []) {
-    const info = entry?.info
-    const parts = Array.isArray(entry?.parts) ? entry.parts : []
-    if (!info) continue
+  for (const msg of effective) {
+    const type = String(msg?.type ?? "")
+    if (!type) {
+      messageIndex += 1
+      continue
+    }
 
-    const role = info.role
-    const created = info.time?.created ?? Date.now() / 1000
-    const timestamp = new Date(created * 1000)
-    const model = role === "assistant"
-      ? `${info.providerID || ""}/${info.modelID || ""}`
+    const created = msg?.time?.created
+    const timestamp = new Date(typeof created === "number" ? created : Date.now())
+
+    if (type === "idle") {
+      rows.push(node({
+        sessionId,
+        timestamp,
+        role: "system",
+        content: "",
+        repository,
+        model: "",
+        messageIndex,
+        nodeId: nextNodeId++,
+        parentId: lastMessageNodeId,
+        nodeType: NODE_STEP,
+        status: String(msg.outcome ?? "idle"),
+        harness,
+      }))
+      messageIndex += 1
+      continue
+    }
+
+    const role = ROLE_BY_TYPE[type] ?? "system"
+    const content = messageContent(msg)
+    const model = type === "assistant"
+      ? `${msg.model?.providerID ?? ""}/${msg.model?.id ?? ""}`
       : ""
 
-    const usage = info.usage || entry?.usage || {}
-    const tokensIn = usage.prompt_tokens ?? usage.input_tokens ?? null
-    const tokensOut = usage.completion_tokens ?? usage.output_tokens ?? null
-
-    const textParts = parts
-      .filter((p) => p.type === "text" && p.text)
-      .map((p) => p.text)
-    const content = textParts.join("\n")
-
-    if (!content.trim() && parts.length === 0) continue
+    const tokens = msg?.tokens ?? {}
+    const tokensIn = Number.isFinite(tokens.input) ? tokens.input : null
+    const tokensOut = Number.isFinite(tokens.output) ? tokens.output : null
 
     const messageNodeId = nextNodeId++
     const parentId = role === "user" ? 0 : (lastUserNodeId || 0)
+    const topic = role === "user" ? lookupTopic(topics, userOrdinal, content) : ""
+    if (role === "user") userOrdinal += 1
+
     rows.push(node({
       sessionId,
       timestamp,
@@ -134,108 +263,68 @@ export function buildRows(rawMessages, { sessionId, repository = "", harness = "
       tokensIn,
       tokensOut,
       harness,
+      topic,
     }))
 
     if (role === "user") lastUserNodeId = messageNodeId
+    lastMessageNodeId = messageNodeId
 
-    let stepNodeId = null
-    for (const part of parts) {
-      const type = part?.type
-      if (type === "step-start") {
-        stepNodeId = nextNodeId++
-        rows.push(node({
-          sessionId,
-          timestamp,
-          role,
-          content: "",
-          repository,
-          model,
-          messageIndex,
-          nodeId: stepNodeId,
-          parentId: messageNodeId,
-          nodeType: NODE_STEP,
-          status: "started",
-          harness,
-        }))
-      } else if (type === "reasoning") {
-        if (stepNodeId === null) {
-          stepNodeId = nextNodeId++
+    if (type === "assistant") {
+      const items = Array.isArray(msg.content) ? msg.content : []
+      const stepNodeId = nextNodeId++
+      rows.push(node({
+        sessionId,
+        timestamp,
+        role,
+        content: "",
+        repository,
+        model,
+        messageIndex,
+        nodeId: stepNodeId,
+        parentId: messageNodeId,
+        nodeType: NODE_STEP,
+        status: String(msg.finish ?? "started"),
+        harness,
+      }))
+
+      for (const item of items) {
+        if (item?.type === "reasoning") {
           rows.push(node({
             sessionId,
             timestamp,
             role,
-            content: "",
+            content: summarize(item.text, 500),
             repository,
             model,
             messageIndex,
-            nodeId: stepNodeId,
-            parentId: messageNodeId,
-            nodeType: NODE_STEP,
-            status: "considering",
+            nodeId: nextNodeId++,
+            parentId: stepNodeId,
+            nodeType: NODE_REASONING,
             harness,
           }))
-        }
-        rows.push(node({
-          sessionId,
-          timestamp,
-          role,
-          content: summarize(part?.text, 500),
-          repository,
-          model,
-          messageIndex,
-          nodeId: nextNodeId++,
-          parentId: stepNodeId,
-          nodeType: NODE_REASONING,
-          harness,
-        }))
-      } else if (type === "tool") {
-        if (stepNodeId === null) {
-          stepNodeId = nextNodeId++
+        } else if (item?.type === "tool") {
+          const state = item.state ?? {}
+          const toolInput = summarize(
+            JSON.stringify(state.input ?? ""),
+            200,
+          )
           rows.push(node({
             sessionId,
             timestamp,
             role,
-            content: "",
+            content: summarize(item.name || toolInput || "(outil)", 120),
             repository,
             model,
             messageIndex,
-            nodeId: stepNodeId,
-            parentId: messageNodeId,
-            nodeType: NODE_STEP,
-            status: "acting",
+            nodeId: nextNodeId++,
+            parentId: stepNodeId,
+            nodeType: NODE_TOOL,
+            status: String(state.status ?? "running"),
+            tool: String(item.name ?? ""),
+            input: toolInput,
             harness,
           }))
         }
-        const state = part?.state || {}
-        const toolInput = summarize(
-          JSON.stringify(state.input ?? part?.input ?? ""),
-          200,
-        )
-        rows.push(node({
-          sessionId,
-          timestamp,
-          role,
-          content: summarize(
-            part?.tool || toolInput || "(outil)",
-            120,
-          ),
-          repository,
-          model,
-          messageIndex,
-          nodeId: nextNodeId++,
-          parentId: stepNodeId,
-          nodeType: NODE_TOOL,
-          status: String(state.status || "running"),
-          tool: String(part?.tool || ""),
-          input: toolInput,
-          harness,
-        }))
-      } else if (type === "step-finish") {
-        if (stepNodeId !== null) {
-          const step = rows.find((r) => r.decision_node_id === stepNodeId)
-          if (step) step.decision_status = String(part?.reason || "finish")
-        }
-        stepNodeId = null
       }
     }
 
@@ -267,9 +356,47 @@ export function cleanupFile(filePath) {
 
 export const REDPANDA_TOPIC = "sessions"
 
+// `localhost:9093` est le listener hote (advertise EXTERNAL://localhost:9093) ;
+// `localhost:9092` annonce `redpanda:9092`, nom interne Docker intraduisible
+// depuis la machine hote ou tourne le plugin.
+export const HOST_BROKERS = ["localhost:9093", "localhost:9092"]
+
 export function redpandaBrokers() {
-  const value = process.env.REDPANDA_BROKERS || "localhost:9092"
+  const value = process.env.REDPANDA_BROKERS || ""
   return value.split(",").map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * Le plugin tourne sur la machine hote, pas dans le reseau Docker : un nom
+ * interne comme `redpanda:9092` n'est pas resolvable. On ne garde que les
+ * brokers resolvables, le listener hote en tete.
+ */
+export async function brokerCandidates() {
+  const list = []
+  for (const broker of [...HOST_BROKERS, ...redpandaBrokers()]) {
+    if (!list.includes(broker)) list.push(broker)
+  }
+  const usable = []
+  for (const broker of list) {
+    const host = broker.split(":")[0]
+    try {
+      await lookup(host)
+      usable.push(broker)
+    } catch {
+      // nom interne Docker : ignore depuis l'hote
+    }
+  }
+  return usable.length > 0 ? usable : list
+}
+
+function kafkaClientOptions(brokers) {
+  return {
+    clientId: "session-archive",
+    brokers,
+    connectionTimeout: 3000,
+    requestTimeout: 15000,
+    retry: { retries: 2 },
+  }
 }
 
 export function hashRow(row) {
@@ -288,8 +415,8 @@ export function resetProducer() {
 async function ensureTopic(topic, brokers) {
   const key = `${brokers.join(",")}|${topic}`
   if (topicEnsured === key) return
-  const { Kafka, TopicAlreadyExistsError } = await import("kafkajs")
-  const client = new Kafka({ clientId: "session-archive", brokers })
+  const { Kafka } = await import("kafkajs")
+  const client = new Kafka(kafkaClientOptions(brokers))
   const admin = client.admin()
   await admin.connect()
   try {
@@ -298,7 +425,10 @@ async function ensureTopic(topic, brokers) {
       waitForLeaders: true,
     })
   } catch (err) {
-    if (!(err instanceof TopicAlreadyExistsError)) {
+    // kafkajs 2.x n'expose pas ses classes d'erreur : on teste le type.
+    const type = err?.type ?? ""
+    const name = err?.name ?? ""
+    if (type !== "TOPIC_ALREADY_EXISTS" && name !== "TopicAlreadyExistsError") {
       throw new Error(`Failed to create topic ${topic}: ${err?.message || err}`)
     }
   } finally {
@@ -311,23 +441,28 @@ async function getProducer(brokers) {
   const key = brokers.join(",")
   if (producerHolder && producerHolder.key === key) return producerHolder.producer
   const { Kafka } = await import("kafkajs")
-  const client = new Kafka({ clientId: "session-archive", brokers })
+  const client = new Kafka(kafkaClientOptions(brokers))
   const producer = client.producer({ allowAutoTopicCreation: false })
   await producer.connect()
   producerHolder = { key, producer }
   return producer
 }
 
-export async function publishToRedpanda(rows, { brokers = redpandaBrokers(), topic = REDPANDA_TOPIC } = {}) {
+export async function publishToRedpanda(rows, { brokers, topic = REDPANDA_TOPIC } = {}) {
   if (rows.length === 0) return { topic, count: 0, status: "published" }
-  await ensureTopic(topic, brokers)
-  const producer = await getProducer(brokers)
+  const candidates = brokers && brokers.length > 0 ? brokers : await brokerCandidates()
   const messages = rows.map((row) => ({ key: row.session_id, value: JSON.stringify(row) }))
-  try {
-    await producer.send({ topic, messages })
-  } catch (err) {
-    resetProducer()
-    throw err
+  let lastError = null
+  for (const candidate of candidates) {
+    try {
+      await ensureTopic(topic, [candidate])
+      const producer = await getProducer([candidate])
+      await producer.send({ topic, messages })
+      return { topic, count: rows.length, status: "published", broker: candidate }
+    } catch (err) {
+      lastError = err
+      resetProducer()
+    }
   }
-  return { topic, count: rows.length, status: "published" }
+  throw lastError ?? new Error("aucun broker Redpanda joignable")
 }
