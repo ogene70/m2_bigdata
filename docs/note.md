@@ -23,3 +23,16 @@ Moyenne - Median = lorsqu'on a des valeurs extremes il faut prendre la median au
 
 
 fe_oa_0752cc124703f114ca77823f9d2d1f654f78f95bbcb2cf03
+
+## 13/11/2026
+Review du fil de l'intervention:
+BigData -> Temps reel -> ETL/ETL[avec DBT] -> RPA -> ML.
+les intros de benjamin
+- imagenet 
+- Entropie -> limite des agent de codage lors des tâche de code.
+Matt POCOCK 
+OLAP OLTP
+le stockage S3
+Theoreme cap ->
+ACID -> coherence & disponibilité A->exemple:analogue et digital 
+RDD segmentation de calcul avec spark

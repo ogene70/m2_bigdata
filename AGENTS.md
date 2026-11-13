@@ -445,3 +445,4 @@ archives/20261021-152825-a926b56e8ac8.parquet
 - Do not use AWS endpoints.
 - Use only the local Dockerized MinIO instance.
 - Do not modify `redpanda-connect/s3-archive.yaml` Parquet schema or the `iceberg-ingest` Spark job / table layout without coordinating with the dashboard and Spark config. 
+- Always create subagents to execute multitasks and delete them after task ended 
