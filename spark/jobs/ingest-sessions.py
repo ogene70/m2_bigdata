@@ -118,31 +118,8 @@ def upsert_to_iceberg(batch_df, batch_id):
         USING sessions_stage AS s
         ON  t.session_id = s.session_id
         AND t.decision_node_id = s.decision_node_id
-        WHEN MATCHED THEN UPDATE SET
-            t.`timestamp` = s.`timestamp`,
-            t.role = s.role,
-            t.content = s.content,
-            t.repository = s.repository,
-            t.model = s.model,
-            t.message_index = s.message_index,
-            t.decision_parent_id = s.decision_parent_id,
-            t.decision_node_type = s.decision_node_type,
-            t.decision_status = s.decision_status,
-            t.tool_name = s.tool_name,
-            t.tool_input = s.tool_input,
-            t.tokens_in = s.tokens_in,
-            t.tokens_out = s.tokens_out,
-            t.harness = s.harness,
-            t.topic = s.topic
-        WHEN NOT MATCHED THEN INSERT (
-            session_id, `timestamp`, role, content, repository, model, message_index,
-            decision_node_id, decision_parent_id, decision_node_type, decision_status,
-            tool_name, tool_input, tokens_in, tokens_out, harness, topic
-        ) VALUES (
-            s.session_id, s.`timestamp`, s.role, s.content, s.repository, s.model, s.message_index,
-            s.decision_node_id, s.decision_parent_id, s.decision_node_type, s.decision_status,
-            s.tool_name, s.tool_input, s.tokens_in, s.tokens_out, s.harness, s.topic
-        )
+        WHEN MATCHED THEN UPDATE SET *
+        WHEN NOT MATCHED THEN INSERT *
         """
     )
 

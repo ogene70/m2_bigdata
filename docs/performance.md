@@ -84,6 +84,14 @@ Détail des changements non triviaux :
 - **Maintenance en `local[1]`.** Elle tourne dans son propre conteneur, en mode
   local : elle ne prend pas les cœurs du worker, déjà réservés par
   `iceberg-ingest` (jusqu'à 2) et `spark-connect` (2) sur un worker de 4.
+- **Déduplication simplifiée.** Le job ne collecte plus les fichiers pour
+  lire leurs mtimes via une JVM + UDF (`_file_mtimes`, collecte driver
+  `batch_df.select("_file").collect()`) : une **seule fenêtre**
+  `row_number` sur `(session_id, decision_node_id)` ordonnée par
+  `timestamp desc, message_index desc` suffit pour garder le dernier écrit.
+- **`MERGE` simplifié.** `WHEN MATCHED THEN UPDATE SET *` et
+  `WHEN NOT MATCHED THEN INSERT *` (au lieu de listes de colonnes explicites).
+  Validé en live : commit OK 09:37.
 
 ### Pourquoi la maintenance ne fait *que* compacter
 
@@ -119,11 +127,12 @@ pas de la maintenance Iceberg. Seule la compaction est à la fois utile et sûre
 | Compression Parquet | snappy | **zstd** (vérifié : `COMPRESSION ['ZSTD']`) |
 | Cadence des micro-batches Spark | 1 / s | **1 / 10 s** |
 | Partitionnement | aucun | **`day(timestamp)`** (spec `1000`) |
-| Fichiers de données Iceberg | 52 | **3** juste après compaction — **12** en régime courant (08:37) |
+| Fichiers de données Iceberg | 52 | **2** juste après compaction (à 09:37) — **12** en régime courant |
 | Taille moyenne d'un fichier Iceberg | 7 597 o | **23 337 o** après compaction — **11 070 o** en régime courant |
 | Lignes dans la table | 679 | **679** (aucune perte) |
 | Maintenance | manuelle | **compaction toutes les 30 min** |
 | Rafraîchissement dashboard | 2 s | **5 s** |
+| Code du job d'ingestion | 181 l. | **~100 l.** (déduplication mtimes → fenêtre ; MERGE explicite → `*`) |
 
 « Régime courant » = mesure à 08:37 après plusieurs cycles d'ingestion : la
 compaction ramène périodiquement la table à quelques fichiers, l'ingestion la
